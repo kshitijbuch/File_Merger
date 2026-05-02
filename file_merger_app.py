@@ -605,7 +605,7 @@ with tab_folder:
     with f_col:
         folder_path = st.text_input(
             "Folder path",
-            value=r"C:\Users\Kshitij Buch\OneDrive\Documents\TBM 2026 Onwards\Pending Calls")
+            value=r"C:\Users\Kshitij Buch\OneDrive\Documents\TBM 2026 Onwards\Pending Calls\Raw Files")
     with o_col:
         output_name = st.text_input("Output filename", value="MERGED_output.xlsx")
 
