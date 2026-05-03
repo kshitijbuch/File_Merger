@@ -806,7 +806,7 @@ with tab_upload:
         st.session_state["uf"] = uploaded
         st.success(f"{len(uploaded)} file(s) ready. Go to **Merge & Download**.")
         for i, uf in enumerate(uploaded):
-            with st.expander(f"File {i+1}: {uf.name}", expanded=(i == 0)):
+            with st.expander(f"File {i+1}: {uf.name}", expanded=True):
                 try:
                     data = uf.read(); uf.seek(0)
                     sheets = read_all_sheets_cached(data, uf.name)
@@ -1062,75 +1062,78 @@ with tab_folder:
                 else:
                     st.divider()
 
-                    # Sample first file for column names
-                    try:
-                        sample_sheets = read_from_path(os.path.join(folder_path, selected[0]))
-                        sample_cols   = sorted(
-                            set().union(*[set(d.columns) for d in sample_sheets.values()])
-                            - TRACKING_COLS)
-                    except Exception as e:
-                        st.error(f"Could not read {selected[0]}: {e}")
-                        sample_cols = []
+                    # ── Read all selected files upfront (needed for column mapping) ──
+                    read_key = (folder_path, tuple(sorted(selected)))
+                    if st.session_state.get("_folder_read_key") != read_key:
+                        raw_triples, read_errors = [], []
+                        prog = st.progress(0, text="Scanning files...")
+                        for i, fname in enumerate(selected):
+                            try:
+                                fsheets = read_from_path(
+                                    os.path.join(folder_path, fname))
+                                for sname, df in fsheets.items():
+                                    raw_triples.append((fname, sname, df))
+                            except Exception as e:
+                                read_errors.append(f"{fname}: {e}")
+                            prog.progress((i + 1) / len(selected),
+                                          text=f"Scanning: {fname}")
+                        prog.empty()
+                        st.session_state["_folder_read_key"]    = read_key
+                        st.session_state["_folder_triples"]     = raw_triples
+                        st.session_state["_folder_read_errors"] = read_errors
 
-                    st.markdown("**Merge Settings**")
-                    cfg, key_col, excl_cols, clean_types, add_src, out_fmt = render_settings(
-                        sample_cols, "folder")
-                    st.divider()
+                    raw_triples = st.session_state.get("_folder_triples", [])
+                    for err in st.session_state.get("_folder_read_errors", []):
+                        st.warning(f"Could not read: {err}")
 
-                    if st.button("Run Folder Merge", type="primary", use_container_width=True):
-                        if cfg["needs_key"] and not key_col:
-                            st.error("Please select a key column.")
-                        else:
-                            prog        = st.progress(0, text="Reading files...")
-                            all_triples = []
-                            errors      = []
+                    if not raw_triples:
+                        st.error("No sheets could be read from the selected files.")
+                    else:
+                        # ── Step 1: Column alignment ───────────────────────────
+                        st.markdown("### Step 1 — Column Alignment")
+                        folder_renames = render_column_mapping(raw_triples)
+                        mapped_triples = apply_renames_to_triples(
+                            raw_triples, folder_renames)
 
-                            for i, fname in enumerate(selected):
-                                fpath = os.path.join(folder_path, fname)
-                                try:
-                                    fsheets = read_from_path(fpath)
-                                    for sname, df in fsheets.items():
-                                        d = df.copy()
-                                        if add_src:
-                                            d.insert(0, "Source File",  fname)
-                                            d.insert(1, "Source Sheet", sname)
-                                        all_triples.append((fname, sname, d))
-                                except Exception as e:
-                                    errors.append(f"{fname}: {e}")
-                                prog.progress((i + 1) / len(selected),
-                                              text=f"Reading: {fname}")
+                        st.divider()
 
-                            prog.empty()
-                            for err in errors:
-                                st.warning(f"Could not read: {err}")
+                        # ── Step 2: Merge settings ─────────────────────────────
+                        st.markdown("### Step 2 — Merge Settings")
+                        all_folder_cols = sorted(
+                            set().union(*[set(e[2].columns)
+                                          for e in mapped_triples]) - TRACKING_COLS)
+                        cfg, key_col, excl_cols, clean_types, add_src, out_fmt = \
+                            render_settings(all_folder_cols, "folder")
+                        st.divider()
 
-                            if not all_triples:
-                                st.error("No sheets could be read.")
+                        if st.button("Run Folder Merge", type="primary",
+                                     use_container_width=True):
+                            if cfg["needs_key"] and not key_col:
+                                st.error("Please select a key column.")
                             else:
-                                # Column mapping
-                                with st.expander("Column Alignment (folder mode)",
-                                                 expanded=True):
-                                    folder_renames = render_column_mapping(all_triples)
-                                    mapped_triples = apply_renames_to_triples(
-                                        all_triples, folder_renames)
+                                # Apply source columns + type cleaning
+                                all_triples = []
+                                all_type_reports = []
+                                for fname, sname, df in mapped_triples:
+                                    d = df.copy()
+                                    if add_src:
+                                        d.insert(0, "Source File",  fname)
+                                        d.insert(1, "Source Sheet", sname)
+                                    if clean_types:
+                                        d, trpt = clean_dtypes(d)
+                                        all_type_reports.extend(trpt)
+                                    all_triples.append((fname, sname, d))
 
-                                with st.spinner("Grouping and merging..."):
-                                    groups            = group_sheets(mapped_triples)
+                                with st.spinner("Merging..."):
+                                    groups            = group_sheets(all_triples)
                                     new_output_sheets = {}
                                     all_audits        = []
-                                    all_type_reports  = []
                                     total_in = total_out = 0
 
                                     for cols_key, entries in groups:
                                         out_name = " + ".join(
                                             sorted({e[1] for e in entries}))[:31]
-                                        dfs = []
-                                        for fname, sname, df in entries:
-                                            d = df.copy()
-                                            if clean_types:
-                                                d, trpt = clean_dtypes(d)
-                                                all_type_reports.extend(trpt)
-                                            dfs.append(d)
+                                        dfs = [e[2] for e in entries]
                                         try:
                                             result, audit = cfg["fn"](
                                                 dfs, key=key_col,
@@ -1157,13 +1160,11 @@ with tab_folder:
                                     else:
                                         final_sheets = new_output_sheets
 
-                                # Save for dashboard
                                 st.session_state["merged_sheets"] = final_sheets
 
                                 n_total = sum(len(d) for d in final_sheets.values())
-                                st.success(
-                                    f"Done! {len(final_sheets)} sheet(s), "
-                                    f"{n_total:,} total rows.")
+                                st.success(f"Done! {len(final_sheets)} sheet(s), "
+                                           f"{n_total:,} total rows.")
 
                                 m1, m2, m3, m4 = st.columns(4)
                                 m1.metric("Groups",       len(final_sheets))
@@ -1188,7 +1189,6 @@ with tab_folder:
                                                      use_container_width=True,
                                                      hide_index=True)
 
-                                # Save to folder
                                 try:
                                     xl_bytes = to_excel_bytes(final_sheets)
                                     with open(output_path, "wb") as fh:
@@ -1197,7 +1197,6 @@ with tab_folder:
                                 except Exception as e:
                                     st.warning(f"Could not save to folder: {e}")
 
-                                # Download
                                 if out_fmt.startswith("Excel"):
                                     dl_data = to_excel_bytes(final_sheets)
                                     dl_name = output_name
