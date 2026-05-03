@@ -12,6 +12,13 @@ import streamlit as st
 from matplotlib_venn import venn2, venn2_circles
 
 try:
+    import tkinter as tk
+    from tkinter import filedialog as _tkfd
+    HAS_TKINTER = True
+except Exception:
+    HAS_TKINTER = False
+
+try:
     import plotly.express as px
     HAS_PLOTLY = True
 except ImportError:
@@ -985,19 +992,38 @@ with tab_folder:
         "groups their sheets by column structure, and merges matching groups. "
         "Supports **incremental append** when new files arrive.")
 
+    # ── Browse button (native Windows folder picker) ──────────────────────────
+    if HAS_TKINTER and st.button("📁 Browse for folder...", key="folder_browse_btn"):
+        _root = tk.Tk()
+        _root.withdraw()
+        _root.wm_attributes("-topmost", 1)
+        _picked = _tkfd.askdirectory(title="Select folder containing your files")
+        _root.destroy()
+        if _picked:
+            # tkinter returns forward-slash paths; normalise for Windows
+            st.session_state["_folder_path_input"] = os.path.normpath(_picked)
+        st.rerun()
+
     f_col, o_col = st.columns([3, 2])
     with f_col:
+        _default_path = st.session_state.get(
+            "_folder_path_input",
+            r"C:\Users\Kshitij Buch\OneDrive\Documents\TBM 2026 Onwards\Pending Calls\Raw Files")
         folder_path = st.text_input(
-            "Folder path",
-            value=r"C:\Users\Kshitij Buch\OneDrive\Documents\TBM 2026 Onwards\Pending Calls\Raw Files")
+            "Folder path (type or use Browse button above)",
+            value=_default_path,
+            key="_folder_path_text")
     with o_col:
         output_name = st.text_input("Output filename", value="MERGED_output.xlsx")
+
+    # Sync typed value back to session state so Browse and typing both work
+    st.session_state["_folder_path_input"] = folder_path
 
     # Strip whitespace and surrounding quotes (common when copy-pasting from Explorer)
     folder_path = folder_path.strip().strip('"').strip("'").strip()
     output_name = output_name.strip().strip('"').strip("'").strip()
 
-    # Try to list the folder — more reliable than os.path.isdir() on OneDrive paths
+    # Try to list the folder
     _folder_ok = False
     _folder_list_err = None
     if folder_path:
@@ -1008,13 +1034,13 @@ with tab_folder:
             _folder_list_err = str(_e)
 
     if not folder_path:
-        st.info("Enter a folder path above.")
+        st.info("Enter a folder path above, or click Browse to pick one.")
     elif not _folder_ok:
         st.error(
-            f"Folder not found or not accessible. Path received:\n\n"
+            f"Folder not accessible. Path the app is checking:\n\n"
             f"`{folder_path}`\n\n"
-            + (f"Error: `{_folder_list_err}`\n\n" if _folder_list_err else "")
-            + "Tips: make sure the folder exists and the drive letter is correct."
+            + (f"OS error: `{_folder_list_err}`\n\n" if _folder_list_err else "")
+            + "Try using the **Browse** button instead of typing the path."
         )
     else:
         output_path    = os.path.join(folder_path, output_name)
