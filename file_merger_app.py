@@ -990,225 +990,229 @@ with tab_folder:
 
     if not folder_path:
         st.info("Enter a folder path above.")
-        st.stop()
-    if not os.path.isdir(folder_path):
-        st.error(f"Folder not found: `{folder_path}`")
-        st.stop()
-
-    output_path = os.path.join(folder_path, output_name)
-
-    all_data_files = sorted([
-        f for f in os.listdir(folder_path)
-        if f.lower().endswith((".csv", ".xlsx", ".xls")) and f != output_name
-    ])
-    if not all_data_files:
-        st.warning("No CSV or Excel files found in this folder.")
-        st.stop()
-
-    # Detect already-processed files from existing output
-    already_done       = set()
-    existing_row_count = 0
-    has_existing       = os.path.exists(output_path)
-    ex_sheets          = {}
-    if has_existing:
-        try:
-            ex_sheets = read_from_path(output_path)
-            for df in ex_sheets.values():
-                if "Source File" in df.columns:
-                    already_done.update(df["Source File"].dropna().unique())
-            existing_row_count = sum(len(d) for d in ex_sheets.values())
-        except Exception as e:
-            st.warning(f"Could not read existing output: {e}")
-
-    new_files = [f for f in all_data_files if f not in already_done]
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Files in folder",          len(all_data_files))
-    s2.metric("Already in merged output", len(all_data_files) - len(new_files))
-    s3.metric("New files detected",       len(new_files))
-
-    if has_existing and already_done:
-        st.info(f"Existing **{output_name}** found "
-                f"({existing_row_count:,} rows across {len(ex_sheets)} sheet(s)). "
-                f"{len(new_files)} new file(s) detected.")
-
-    st.divider()
-
-    if has_existing and already_done and new_files:
-        mode = st.radio("Mode",
-                        ["Append only new files", "Re-merge ALL files from scratch"],
-                        horizontal=True)
-    elif has_existing and already_done and not new_files:
-        st.success("Merged file is up to date — no new files detected.")
-        mode = "Re-merge ALL files from scratch"
-        st.caption("You can still re-merge all files to refresh.")
+    elif not os.path.isdir(folder_path):
+        st.error(f"Folder not found: `{folder_path}`  —  check the path and try again.")
     else:
-        mode = "Re-merge ALL files from scratch"
+        output_path    = os.path.join(folder_path, output_name)
+        all_data_files = sorted([
+            f for f in os.listdir(folder_path)
+            if f.lower().endswith((".csv", ".xlsx", ".xls")) and f != output_name
+        ])
 
-    files_to_show = new_files if mode.startswith("Append") else all_data_files
-    if not files_to_show:
-        st.info("No files to process under the current mode.")
-        st.stop()
-
-    st.markdown(f"**Files to process ({len(files_to_show)}) — uncheck to skip:**")
-    selected = []
-    cols_row = st.columns(2)
-    for i, f in enumerate(files_to_show):
-        with cols_row[i % 2]:
-            if st.checkbox(f, value=True, key=f"fc_{f}"):
-                selected.append(f)
-
-    if not selected:
-        st.warning("No files selected.")
-        st.stop()
-
-    st.divider()
-
-    # Sample first file for column names
-    try:
-        sample_sheets = read_from_path(os.path.join(folder_path, selected[0]))
-        sample_cols   = sorted(
-            set().union(*[set(d.columns) for d in sample_sheets.values()])
-            - TRACKING_COLS)
-    except Exception as e:
-        st.error(f"Could not read {selected[0]}: {e}")
-        sample_cols = []
-
-    st.markdown("**Merge Settings**")
-    cfg, key_col, excl_cols, clean_types, add_src, out_fmt = render_settings(
-        sample_cols, "folder")
-    st.divider()
-
-    if st.button("Run Folder Merge", type="primary", use_container_width=True):
-        if cfg["needs_key"] and not key_col:
-            st.error("Please select a key column.")
-            st.stop()
-
-        prog         = st.progress(0, text="Reading files...")
-        all_triples  = []
-        errors       = []
-
-        for i, fname in enumerate(selected):
-            fpath = os.path.join(folder_path, fname)
-            try:
-                fsheets = read_from_path(fpath)
-                for sname, df in fsheets.items():
-                    d = df.copy()
-                    if add_src:
-                        d.insert(0, "Source File",  fname)
-                        d.insert(1, "Source Sheet", sname)
-                    all_triples.append((fname, sname, d))
-            except Exception as e:
-                errors.append(f"{fname}: {e}")
-            prog.progress((i + 1) / len(selected), text=f"Reading: {fname}")
-
-        prog.empty()
-        for err in errors:
-            st.warning(f"Could not read: {err}")
-
-        if not all_triples:
-            st.error("No sheets could be read.")
-            st.stop()
-
-        # Column mapping for folder mode
-        with st.expander("Column Alignment (folder mode)", expanded=True):
-            folder_renames  = render_column_mapping(all_triples)
-            mapped_triples  = apply_renames_to_triples(all_triples, folder_renames)
-
-        with st.spinner("Grouping and merging..."):
-            groups           = group_sheets(mapped_triples)
-            new_output_sheets = {}
-            all_audits        = []
-            all_type_reports  = []
-            total_in = total_out = 0
-
-            for cols_key, entries in groups:
-                out_name = " + ".join(sorted({e[1] for e in entries}))[:31]
-                dfs = []
-                for fname, sname, df in entries:
-                    d = df.copy()
-                    if clean_types:
-                        d, trpt = clean_dtypes(d)
-                        all_type_reports.extend(trpt)
-                    dfs.append(d)
-
-                try:
-                    result, audit = cfg["fn"](
-                        dfs, key=key_col,
-                        excl=set(excl_cols) if excl_cols else None)
-                except Exception as e:
-                    st.warning(f"Merge failed for group '{out_name}': {e}")
-                    result = pd.concat(dfs, ignore_index=True)
-                    audit  = pd.DataFrame()
-
-                n_in       = sum(len(d) for d in dfs)
-                total_in  += n_in
-                total_out += len(result)
-                new_output_sheets[out_name] = result
-                all_audits.append(audit)
-
-            if mode.startswith("Append") and has_existing:
-                final_sheets = dict(ex_sheets)
-                for sname, new_df in new_output_sheets.items():
-                    if sname in final_sheets:
-                        final_sheets[sname] = pd.concat(
-                            [final_sheets[sname], new_df], ignore_index=True)
-                    else:
-                        final_sheets[sname] = new_df
-            else:
-                final_sheets = new_output_sheets
-
-        # Save for dashboard
-        st.session_state["merged_sheets"] = final_sheets
-
-        n_total = sum(len(d) for d in final_sheets.values())
-        st.success(f"Done! {len(final_sheets)} sheet(s), {n_total:,} total rows.")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Groups",           len(final_sheets))
-        m2.metric("Input rows",       f"{total_in:,}")
-        m3.metric("Output rows",      f"{total_out:,}")
-        m4.metric("Rows removed",     f"{total_in - total_out:,}")
-
-        if all_type_reports:
-            with st.expander(f"Data Type Cleaning — "
-                             f"{len(set(all_type_reports))} change(s)"):
-                for line in sorted(set(all_type_reports)):
-                    st.markdown(f"- {line}")
-
-        show_audit(all_audits)
-
-        for sname, df in final_sheets.items():
-            with st.expander(f"Sheet: '{sname}'  ({len(df):,} rows)", expanded=False):
-                st.dataframe(df.head(50), use_container_width=True, hide_index=True)
-
-        # Save to folder
-        try:
-            xl_bytes = to_excel_bytes(final_sheets)
-            with open(output_path, "wb") as fh:
-                fh.write(xl_bytes)
-            st.info(f"Saved: `{output_path}`")
-        except Exception as e:
-            st.warning(f"Could not save to folder: {e}")
-
-        # Download
-        if out_fmt.startswith("Excel"):
-            dl_data = to_excel_bytes(final_sheets)
-            dl_name = output_name
-            dl_mime = ("application/vnd.openxmlformats-"
-                       "officedocument.spreadsheetml.sheet")
+        if not all_data_files:
+            st.warning("No CSV or Excel files found in this folder.")
         else:
-            first_df = next(iter(final_sheets.values()))
-            dl_data  = to_csv_bytes(first_df)
-            dl_name  = output_name.replace(".xlsx", ".csv")
-            dl_mime  = "text/csv"
+            # Detect already-processed files from existing output
+            already_done       = set()
+            existing_row_count = 0
+            has_existing       = os.path.exists(output_path)
+            ex_sheets          = {}
+            if has_existing:
+                try:
+                    ex_sheets = read_from_path(output_path)
+                    for df in ex_sheets.values():
+                        if "Source File" in df.columns:
+                            already_done.update(df["Source File"].dropna().unique())
+                    existing_row_count = sum(len(d) for d in ex_sheets.values())
+                except Exception as e:
+                    st.warning(f"Could not read existing output: {e}")
 
-        st.download_button(
-            f"Download {dl_name}", data=dl_data,
-            file_name=dl_name, mime=dl_mime,
-            use_container_width=True, type="primary")
+            new_files = [f for f in all_data_files if f not in already_done]
 
-        st.info("Go to the **📊 Dashboard** tab to explore and export charts.")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Files in folder",          len(all_data_files))
+            s2.metric("Already in merged output", len(all_data_files) - len(new_files))
+            s3.metric("New files detected",       len(new_files))
+
+            if has_existing and already_done:
+                st.info(f"Existing **{output_name}** found "
+                        f"({existing_row_count:,} rows across {len(ex_sheets)} sheet(s)). "
+                        f"{len(new_files)} new file(s) detected.")
+
+            st.divider()
+
+            if has_existing and already_done and new_files:
+                mode = st.radio("Mode",
+                                ["Append only new files", "Re-merge ALL files from scratch"],
+                                horizontal=True)
+            elif has_existing and already_done and not new_files:
+                st.success("Merged file is up to date — no new files detected.")
+                mode = "Re-merge ALL files from scratch"
+                st.caption("You can still re-merge all files to refresh.")
+            else:
+                mode = "Re-merge ALL files from scratch"
+
+            files_to_show = new_files if mode.startswith("Append") else all_data_files
+            if not files_to_show:
+                st.info("No files to process under the current mode.")
+            else:
+                st.markdown(f"**Files to process ({len(files_to_show)}) — uncheck to skip:**")
+                selected = []
+                cols_row = st.columns(2)
+                for i, f in enumerate(files_to_show):
+                    with cols_row[i % 2]:
+                        if st.checkbox(f, value=True, key=f"fc_{f}"):
+                            selected.append(f)
+
+                if not selected:
+                    st.warning("No files selected.")
+                else:
+                    st.divider()
+
+                    # Sample first file for column names
+                    try:
+                        sample_sheets = read_from_path(os.path.join(folder_path, selected[0]))
+                        sample_cols   = sorted(
+                            set().union(*[set(d.columns) for d in sample_sheets.values()])
+                            - TRACKING_COLS)
+                    except Exception as e:
+                        st.error(f"Could not read {selected[0]}: {e}")
+                        sample_cols = []
+
+                    st.markdown("**Merge Settings**")
+                    cfg, key_col, excl_cols, clean_types, add_src, out_fmt = render_settings(
+                        sample_cols, "folder")
+                    st.divider()
+
+                    if st.button("Run Folder Merge", type="primary", use_container_width=True):
+                        if cfg["needs_key"] and not key_col:
+                            st.error("Please select a key column.")
+                        else:
+                            prog        = st.progress(0, text="Reading files...")
+                            all_triples = []
+                            errors      = []
+
+                            for i, fname in enumerate(selected):
+                                fpath = os.path.join(folder_path, fname)
+                                try:
+                                    fsheets = read_from_path(fpath)
+                                    for sname, df in fsheets.items():
+                                        d = df.copy()
+                                        if add_src:
+                                            d.insert(0, "Source File",  fname)
+                                            d.insert(1, "Source Sheet", sname)
+                                        all_triples.append((fname, sname, d))
+                                except Exception as e:
+                                    errors.append(f"{fname}: {e}")
+                                prog.progress((i + 1) / len(selected),
+                                              text=f"Reading: {fname}")
+
+                            prog.empty()
+                            for err in errors:
+                                st.warning(f"Could not read: {err}")
+
+                            if not all_triples:
+                                st.error("No sheets could be read.")
+                            else:
+                                # Column mapping
+                                with st.expander("Column Alignment (folder mode)",
+                                                 expanded=True):
+                                    folder_renames = render_column_mapping(all_triples)
+                                    mapped_triples = apply_renames_to_triples(
+                                        all_triples, folder_renames)
+
+                                with st.spinner("Grouping and merging..."):
+                                    groups            = group_sheets(mapped_triples)
+                                    new_output_sheets = {}
+                                    all_audits        = []
+                                    all_type_reports  = []
+                                    total_in = total_out = 0
+
+                                    for cols_key, entries in groups:
+                                        out_name = " + ".join(
+                                            sorted({e[1] for e in entries}))[:31]
+                                        dfs = []
+                                        for fname, sname, df in entries:
+                                            d = df.copy()
+                                            if clean_types:
+                                                d, trpt = clean_dtypes(d)
+                                                all_type_reports.extend(trpt)
+                                            dfs.append(d)
+                                        try:
+                                            result, audit = cfg["fn"](
+                                                dfs, key=key_col,
+                                                excl=set(excl_cols) if excl_cols else None)
+                                        except Exception as e:
+                                            st.warning(f"Merge failed for '{out_name}': {e}")
+                                            result = pd.concat(dfs, ignore_index=True)
+                                            audit  = pd.DataFrame()
+                                        n_in       = sum(len(d) for d in dfs)
+                                        total_in  += n_in
+                                        total_out += len(result)
+                                        new_output_sheets[out_name] = result
+                                        all_audits.append(audit)
+
+                                    if mode.startswith("Append") and has_existing:
+                                        final_sheets = dict(ex_sheets)
+                                        for sname, new_df in new_output_sheets.items():
+                                            if sname in final_sheets:
+                                                final_sheets[sname] = pd.concat(
+                                                    [final_sheets[sname], new_df],
+                                                    ignore_index=True)
+                                            else:
+                                                final_sheets[sname] = new_df
+                                    else:
+                                        final_sheets = new_output_sheets
+
+                                # Save for dashboard
+                                st.session_state["merged_sheets"] = final_sheets
+
+                                n_total = sum(len(d) for d in final_sheets.values())
+                                st.success(
+                                    f"Done! {len(final_sheets)} sheet(s), "
+                                    f"{n_total:,} total rows.")
+
+                                m1, m2, m3, m4 = st.columns(4)
+                                m1.metric("Groups",       len(final_sheets))
+                                m2.metric("Input rows",   f"{total_in:,}")
+                                m3.metric("Output rows",  f"{total_out:,}")
+                                m4.metric("Rows removed", f"{total_in - total_out:,}")
+
+                                if all_type_reports:
+                                    with st.expander(
+                                            f"Data Type Cleaning — "
+                                            f"{len(set(all_type_reports))} change(s)"):
+                                        for line in sorted(set(all_type_reports)):
+                                            st.markdown(f"- {line}")
+
+                                show_audit(all_audits)
+
+                                for sname, df in final_sheets.items():
+                                    with st.expander(
+                                            f"Sheet: '{sname}'  ({len(df):,} rows)",
+                                            expanded=False):
+                                        st.dataframe(df.head(50),
+                                                     use_container_width=True,
+                                                     hide_index=True)
+
+                                # Save to folder
+                                try:
+                                    xl_bytes = to_excel_bytes(final_sheets)
+                                    with open(output_path, "wb") as fh:
+                                        fh.write(xl_bytes)
+                                    st.info(f"Saved: `{output_path}`")
+                                except Exception as e:
+                                    st.warning(f"Could not save to folder: {e}")
+
+                                # Download
+                                if out_fmt.startswith("Excel"):
+                                    dl_data = to_excel_bytes(final_sheets)
+                                    dl_name = output_name
+                                    dl_mime = ("application/vnd.openxmlformats-"
+                                               "officedocument.spreadsheetml.sheet")
+                                else:
+                                    first_df = next(iter(final_sheets.values()))
+                                    dl_data  = to_csv_bytes(first_df)
+                                    dl_name  = output_name.replace(".xlsx", ".csv")
+                                    dl_mime  = "text/csv"
+
+                                st.download_button(
+                                    f"Download {dl_name}", data=dl_data,
+                                    file_name=dl_name, mime=dl_mime,
+                                    use_container_width=True, type="primary")
+
+                                st.info("Go to the **📊 Dashboard** tab to explore "
+                                        "and export charts.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
