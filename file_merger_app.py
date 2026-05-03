@@ -988,6 +988,9 @@ with tab_folder:
     with o_col:
         output_name = st.text_input("Output filename", value="MERGED_output.xlsx")
 
+    folder_path = folder_path.strip()
+    output_name = output_name.strip()
+
     if not folder_path:
         st.info("Enter a folder path above.")
     elif not os.path.isdir(folder_path):
