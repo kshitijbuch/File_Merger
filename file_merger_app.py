@@ -424,13 +424,17 @@ def to_csv_bytes(df):
 # COLUMN MAPPING UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_column_mapping(all_triples):
+def render_column_mapping(all_triples, tab_key="upload"):
     """
     Detects column-name mismatches across files and shows a mapping form.
     The user assigns a canonical name to columns that mean the same thing.
     Returns renames_map: {filename: {original_col: canonical_col}}
-    Persists in st.session_state["col_renames"] across re-runs.
+    Persists in st.session_state per tab_key across re-runs.
+    tab_key must be unique per call site to avoid Streamlit DuplicateWidgetID errors.
     """
+    ss_key   = f"col_renames_{tab_key}"
+    form_key = f"col_mapping_form_{tab_key}"
+
     file_cols = {}
     for fname, _sname, df in all_triples:
         file_cols.setdefault(fname, set()).update(
@@ -438,7 +442,7 @@ def render_column_mapping(all_triples):
 
     fnames = list(file_cols.keys())
     if len(fnames) < 2:
-        return st.session_state.get("col_renames", {})
+        return st.session_state.get(ss_key, {})
 
     all_unique = set().union(*file_cols.values())
     common     = set.intersection(*file_cols.values())
@@ -446,7 +450,7 @@ def render_column_mapping(all_triples):
 
     if not unmatched:
         st.success("All files share identical column names — no mapping needed.")
-        st.session_state["col_renames"] = {}
+        st.session_state[ss_key] = {}
         return {}
 
     st.warning(
@@ -455,13 +459,13 @@ def render_column_mapping(all_triples):
         "Leave a name unchanged to keep that column separate in the output.")
 
     # Show current applied renames as a reminder
-    existing = st.session_state.get("col_renames", {})
+    existing = st.session_state.get(ss_key, {})
     if existing:
         total_applied = sum(len(v) for v in existing.values())
         st.info(f"Currently applied: {total_applied} rename(s) from a previous mapping. "
                 "Re-submit the form below to change them.")
 
-    with st.form("col_mapping_form"):
+    with st.form(form_key):
         st.markdown("**Column Alignment — assign canonical names:**")
         rows_data = []
         for col in unmatched:
@@ -475,7 +479,8 @@ def render_column_mapping(all_triples):
                 if col in file_cols[f] and col in existing.get(f, {}):
                     prev_canonical = existing[f][col]
                     break
-            canonical = st.text_input(label, value=prev_canonical, key=f"cmap_{col}")
+            canonical = st.text_input(label, value=prev_canonical,
+                                      key=f"cmap_{tab_key}_{col}")
             rows_data.append((col, [f for f in fnames if col in file_cols[f]], canonical.strip()))
 
         submitted = st.form_submit_button(
@@ -487,14 +492,14 @@ def render_column_mapping(all_triples):
             if canonical and canonical != col:
                 for f in files_with_col:
                     renames_map.setdefault(f, {})[col] = canonical
-        st.session_state["col_renames"] = renames_map
+        st.session_state[ss_key] = renames_map
         n = sum(len(v) for v in renames_map.values())
         if n:
             st.success(f"Mapping applied: {n} rename(s). Sheets re-grouped below.")
         else:
             st.info("No renames applied — all canonical names match originals.")
 
-    return st.session_state.get("col_renames", {})
+    return st.session_state.get(ss_key, {})
 
 
 def apply_renames_to_triples(triples, renames_map):
@@ -849,7 +854,7 @@ with tab_merge:
 
         # ── Step 1: Column mapping ─────────────────────────────────────────
         st.markdown("### Step 1 — Column Alignment")
-        renames_map    = render_column_mapping(all_triples)
+        renames_map    = render_column_mapping(all_triples, tab_key="upload")
         mapped_triples = apply_renames_to_triples(all_triples, renames_map)
 
         st.divider()
@@ -1091,7 +1096,7 @@ with tab_folder:
                     else:
                         # ── Step 1: Column alignment ───────────────────────────
                         st.markdown("### Step 1 — Column Alignment")
-                        folder_renames = render_column_mapping(raw_triples)
+                        folder_renames = render_column_mapping(raw_triples, tab_key="folder")
                         mapped_triples = apply_renames_to_triples(
                             raw_triples, folder_renames)
 
