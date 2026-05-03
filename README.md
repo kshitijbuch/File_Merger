@@ -11,6 +11,20 @@ This is a **local application** — it runs entirely on your computer in a brows
 No data is uploaded to any server. No internet connection is required after the first setup.
 Anyone who has Python installed can run it — it is freely usable by any user for any files.
 
+### Local vs Cloud
+
+A hosted demo is available at **https://filemerger-kb.streamlit.app**, but not all features
+work there because the cloud server cannot access your PC's file system.
+
+| Feature | Cloud demo | Local (`run_app.bat`) |
+|---------|-----------|----------------------|
+| Learn Merge Types | ✅ | ✅ |
+| Upload Files + Merge | ✅ | ✅ |
+| Dashboard | ✅ | ✅ |
+| **Folder Mode** | ❌ needs local files | ✅ |
+
+**For Folder Mode, always run the app locally via `run_app.bat`.**
+
 ---
 
 ## Quick Start (Windows)
@@ -74,6 +88,9 @@ After every merge you also see:
   with a downloadable CSV report.
 
 ### 4. Folder Mode
+⚠️ **Requires the app to be running locally** (`run_app.bat`). Does not work on the
+cloud-hosted version — the cloud server has no access to your PC's file system.
+
 Point to a folder on your computer. The app auto-detects all CSV/Excel files in it.
 Supports **incremental append** — if you ran a merge before, only new files are added.
 Has the same column mapping, type cleaning, and duplicate audit as the Upload tab.
