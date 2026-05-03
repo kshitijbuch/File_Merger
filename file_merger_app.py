@@ -993,13 +993,19 @@ with tab_folder:
     with o_col:
         output_name = st.text_input("Output filename", value="MERGED_output.xlsx")
 
-    folder_path = folder_path.strip()
-    output_name = output_name.strip()
+    # Strip whitespace and surrounding quotes (common when copy-pasting from Explorer)
+    folder_path = folder_path.strip().strip('"').strip("'").strip()
+    output_name = output_name.strip().strip('"').strip("'").strip()
 
     if not folder_path:
         st.info("Enter a folder path above.")
     elif not os.path.isdir(folder_path):
-        st.error(f"Folder not found: `{folder_path}`  —  check the path and try again.")
+        st.error(
+            f"Folder not found. Path received by the app:\n\n"
+            f"`{folder_path}`\n\n"
+            "Tips: make sure the folder exists, the drive letter is correct, "
+            "and there are no extra quotes or spaces in the path."
+        )
     else:
         output_path    = os.path.join(folder_path, output_name)
         all_data_files = sorted([
