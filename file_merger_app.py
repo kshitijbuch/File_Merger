@@ -670,8 +670,12 @@ def apply_renames_to_triples(triples, renames_map):
 def render_settings(all_cols, tab_key):
     col_l, col_r = st.columns(2)
     with col_l:
-        chosen = st.selectbox("Merge strategy", list(STRATEGIES.keys()),
-                              key=f"strat_{tab_key}")
+        chosen = st.selectbox(
+            "Merge strategy  (7 options — scroll dropdown to see all)",
+            list(STRATEGIES.keys()),
+            key=f"strat_{tab_key}",
+            help="All 7 strategies are in the list. "
+                 "Option 1 — Simple Append is at the top if you scroll up.")
         cfg = STRATEGIES[chosen]
         st.markdown(f'<span class="badge {cfg["badge"]}">{cfg["badge_lbl"]}</span>',
                     unsafe_allow_html=True)
@@ -1184,12 +1188,22 @@ with tab_merge:
                     dl_name  = "merged_output.csv"
                     dl_mime  = "text/csv"
 
-                st.download_button(
-                    f"Download {dl_name}",
-                    data=dl_data, file_name=dl_name, mime=dl_mime,
-                    use_container_width=True, type="primary")
+                # Store in session state — button is rendered OUTSIDE this block
+                # so it persists across widget interactions (e.g. audit download)
+                st.session_state["_upload_dl"] = {
+                    "data": dl_data, "name": dl_name, "mime": dl_mime}
 
                 st.info("Go to the **📊 Dashboard** tab to explore and export charts.")
+
+        # ── Persistent download — shown even after other widgets are clicked ──
+        if "_upload_dl" in st.session_state:
+            _dl = st.session_state["_upload_dl"]
+            st.download_button(
+                f"⬇️ Download {_dl['name']}",
+                data=_dl["data"], file_name=_dl["name"], mime=_dl["mime"],
+                use_container_width=True, type="primary",
+                key="upload_dl_persistent",
+                help="Your last merge output. Re-click 'Run Merge' to regenerate.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1479,13 +1493,25 @@ with tab_folder:
                                     dl_name  = output_name.replace(".xlsx", ".csv")
                                     dl_mime  = "text/csv"
 
-                                st.download_button(
-                                    f"Download {dl_name}", data=dl_data,
-                                    file_name=dl_name, mime=dl_mime,
-                                    use_container_width=True, type="primary")
+                                # Store for persistence
+                                st.session_state["_folder_dl"] = {
+                                    "data": dl_data, "name": dl_name,
+                                    "mime": dl_mime}
 
                                 st.info("Go to the **📊 Dashboard** tab to explore "
                                         "and export charts.")
+
+                        # ── Persistent download — survives widget re-runs ──
+                        if "_folder_dl" in st.session_state:
+                            _dl = st.session_state["_folder_dl"]
+                            st.download_button(
+                                f"⬇️ Download {_dl['name']}",
+                                data=_dl["data"], file_name=_dl["name"],
+                                mime=_dl["mime"],
+                                use_container_width=True, type="primary",
+                                key="folder_dl_persistent",
+                                help="Your last folder merge output. "
+                                     "Re-click 'Run Folder Merge' to regenerate.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
