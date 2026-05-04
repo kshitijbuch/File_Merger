@@ -36,6 +36,7 @@ st.markdown("""
 .badge-orange {background:#fef3c7;color:#92400e;}
 .badge-red    {background:#fee2e2;color:#991b1b;}
 .badge-purple {background:#ede9fe;color:#5b21b6;}
+.badge-teal   {background:#ccfbf1;color:#0f766e;}
 .group-box {background:#f8fafc;border:1px solid #e2e8f0;
             border-radius:8px;padding:12px;margin-bottom:10px;}
 </style>""", unsafe_allow_html=True)
@@ -50,6 +51,26 @@ REGION_KEYWORDS = {"region","zone","area","territory","state","country"}
 
 
 # ─── Dummy data (Learn tab) ────────────────────────────────────────────────────
+@st.cache_data
+def get_dummy_partial():
+    """Demo data for Strategy 7 — two sheets with partial column overlap."""
+    fa = pd.DataFrame({
+        "SR No":      ["SR001", "SR002", "SR003"],
+        "Date":       ["01-Apr", "02-Apr", "03-Apr"],
+        "City":       ["Mumbai", "Delhi",  "Pune"],
+        "Status":     ["Open",   "Closed", "Open"],
+        "ZOHO_Owner": ["Raj",    "Sara",   "Raj"],   # ← only in File A
+    })
+    fb = pd.DataFrame({
+        "SR No":    ["SR001",   "SR002",   "SR004"],
+        "Date":     ["01-Apr",  "02-Apr",  "04-Apr"],
+        "City":     ["Mumbai",  "Delhi",   "Chennai"],
+        "Status":   ["Open",    "Closed",  "Open"],
+        "ERP_Code": ["ERP-001", "ERP-002", "ERP-004"],  # ← only in File B
+    })
+    return fa, fb
+
+
 @st.cache_data
 def get_dummy():
     fa = pd.DataFrame({
@@ -198,6 +219,108 @@ def do_intersection(dfs, key, excl=None):
     return dedup_with_audit(sub, [key])
 
 
+def do_partial_merge(dfs, key=None, excl=None):
+    """
+    Strategy 7 — Partial Column Merge.
+    For sheets with ≥85% column overlap (different column SETS, mostly shared):
+      1. Stack all rows with outer join on columns (NaN where a column is absent).
+      2. Match rows that are identical on ALL common columns.
+      3. Smart-Fill: for matched rows keep first non-null value per column.
+      4. Unmatched rows are kept as-is (NaN for columns from the other sheet).
+    No key column needed — the common columns collectively act as row identity.
+    """
+    if len(dfs) == 1:
+        return dfs[0].copy(), pd.DataFrame()
+
+    # Common columns across every df (these are the row-identity fingerprint)
+    all_col_sets = [set(df.columns) - TRACKING_COLS for df in dfs]
+    common_cols  = sorted(set.intersection(*all_col_sets))
+    check_cols   = [c for c in common_cols if c not in (excl or set())]
+
+    # Preserve column order: left-df cols first, then any extra from right dfs
+    all_cols_ordered = list(dfs[0].columns)
+    for df in dfs[1:]:
+        for c in df.columns:
+            if c not in all_cols_ordered:
+                all_cols_ordered.append(c)
+
+    # Stack with outer join (NaN for missing columns)
+    combined = pd.concat(dfs, ignore_index=True, join="outer")
+    before   = len(combined)
+
+    if not check_cols:
+        # Nothing to match on — just stack
+        return combined, pd.DataFrame()
+
+    # Group by common cols; first() returns first non-null per column = Smart Fill
+    try:
+        result = (combined
+                  .groupby(check_cols, sort=False, dropna=False, as_index=False)
+                  .first())
+    except TypeError:           # older pandas without dropna param
+        result = (combined
+                  .groupby(check_cols, sort=False, as_index=False)
+                  .first())
+
+    after       = len(result)
+    n_merged    = before - after
+    final_cols  = [c for c in all_cols_ordered if c in result.columns]
+    result      = result[final_cols].reset_index(drop=True)
+
+    audit = pd.DataFrame()
+    if n_merged > 0:
+        audit = pd.DataFrame({
+            "Removed Row# (Excel)": [f"— ({n_merged} rows absorbed into others)"],
+            "Note": [f"Rows matched on {len(check_cols)} common columns; "
+                     "extra columns Smart-Filled from whichever sheet had the data"],
+        })
+    return result, audit
+
+
+def group_sheets_partial(file_sheet_dfs, threshold=0.85):
+    """
+    Group sheets where column overlap ≥ threshold (Jaccard on column sets).
+    Returns same format as group_sheets: [(union_col_frozenset, [entries]), ...]
+    Uses union-find clustering so transitivity is handled correctly.
+    """
+    sheets   = list(file_sheet_dfs)
+    col_sets = [frozenset(c for c in df.columns if c not in TRACKING_COLS)
+                for _, _, df in sheets]
+    n = len(sheets)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            u = len(col_sets[i] | col_sets[j])
+            c = len(col_sets[i] & col_sets[j])
+            if u > 0 and c / u >= threshold:
+                union(i, j)
+
+    clusters = {}
+    for i, sheet in enumerate(sheets):
+        clusters.setdefault(find(i), []).append(sheet)
+
+    result = []
+    for entries in clusters.values():
+        union_cols = frozenset().union(
+            *[frozenset(c for c in df.columns if c not in TRACKING_COLS)
+              for _, _, df in entries])
+        result.append((union_cols, entries))
+
+    return sorted(result, key=lambda x: -len(x[1]))
+
+
 STRATEGIES = {
     "1 — Simple Append": dict(
         fn=do_append, needs_key=False, allows_excl=False,
@@ -242,6 +365,22 @@ STRATEGIES = {
         head="Keep ONLY records whose key exists in EVERY uploaded file.",
         detail="Records unique to any single file are excluded entirely.",
         best="Records confirmed across all sources.",
+    ),
+    "7 — Partial Column Merge": dict(
+        fn=do_partial_merge, needs_key=False, allows_excl=False,
+        partial_group=True,
+        icon="🔗", badge="badge-teal", badge_lbl="No key · overlap % configurable",
+        head="Merge sheets that share ≥85% of columns — even if column sets differ.",
+        detail=(
+            "Sheets with mostly-common columns are grouped together (configurable threshold). "
+            "Rows are matched on ALL shared columns acting as a composite fingerprint. "
+            "Matched rows are Smart-Filled (first non-null per column wins). "
+            "Unmatched rows are kept with NaN for columns absent in their source sheet. "
+            "No primary-key column needed — works on any data where common columns "
+            "together uniquely identify a record."
+        ),
+        best="Two systems (e.g. ZOHO + ERP) export mostly the same records with "
+             "slightly different column sets and matching SR/ticket numbers.",
     ),
 }
 
@@ -330,6 +469,13 @@ def make_venn_fig(strategy_name):
             title="Intersection Only",
             desc="Only records whose key exists in ALL files are kept",
             rows="3 rows out (only E003, E004, E005 appear in both files)",
+        ),
+        "7 — Partial Column Merge": dict(
+            c10="#99f6e4", c11="#5eead4", c01="#99f6e4",
+            l10="ZOHO_Owner\n(File A col)", l11="SR No\nDate\nCity\nStatus\n(4 shared)", l01="ERP_Code\n(File B col)",
+            title="Partial Column Merge (≥85% overlap)",
+            desc="Rows matched on shared columns — extra columns filled from each source",
+            rows="4 rows out: SR001+SR002 merged, SR003 (A only), SR004 (B only)",
         ),
     }
     cfg = CFGS.get(strategy_name)
@@ -530,6 +676,15 @@ def render_settings(all_cols, tab_key):
         st.markdown(f'<span class="badge {cfg["badge"]}">{cfg["badge_lbl"]}</span>',
                     unsafe_allow_html=True)
         st.caption(cfg["head"])
+        overlap_pct = 0.85
+        if cfg.get("partial_group"):
+            overlap_pct = st.slider(
+                "Minimum column overlap %",
+                min_value=50, max_value=100, value=85, step=5,
+                key=f"overlap_{tab_key}",
+                help="Sheets whose column sets share at least this % of columns "
+                     "(measured as common ÷ union) are grouped together for partial merge. "
+                     "Default 85% — lower it if your files differ more.") / 100.0
     with col_r:
         key_col, excl_cols = None, []
         if cfg["needs_key"] and all_cols:
@@ -549,7 +704,7 @@ def render_settings(all_cols, tab_key):
         out_fmt = st.radio("Download format",
                            ["Excel (.xlsx) — multi-sheet", "CSV (.csv) — first sheet only"],
                            key=f"fmt_{tab_key}", horizontal=True)
-    return cfg, key_col, excl_cols, clean_types, add_src, out_fmt
+    return cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -777,6 +932,55 @@ with tab_learn:
                         unsafe_allow_html=True)
             st.markdown(f"**{cfg['head']}**\n\n{cfg['detail']}")
             st.markdown(f"*Best for: {cfg['best']}*")
+
+            # ── Strategy 7 gets its own demo data with partial column overlap ──
+            if cfg.get("partial_group"):
+                fa7, fb7 = get_dummy_partial()
+                common_cols = sorted(set(fa7.columns) & set(fb7.columns))
+                overlap_pct_demo = len(common_cols) / len(set(fa7.columns) | set(fb7.columns))
+                try:
+                    raw7, _ = cfg["fn"]([fa7.copy(), fb7.copy()])
+                    col_v, col_t = st.columns([1, 1.4])
+                    with col_v:
+                        fig = make_venn_fig(name)
+                        if fig:
+                            st.pyplot(fig, use_container_width=True)
+                            plt.close(fig)
+                        st.caption(
+                            f"Venn shows **columns** (not records): "
+                            f"{len(common_cols)} shared, 1 unique to each file. "
+                            f"Overlap = {overlap_pct_demo:.0%}")
+                    with col_t:
+                        st.markdown("**File A** — System A (4 common cols + ZOHO_Owner)")
+                        st.dataframe(fa7, use_container_width=True, hide_index=True)
+                        st.markdown("**File B** — System B (4 common cols + ERP_Code)")
+                        st.dataframe(fb7, use_container_width=True, hide_index=True)
+                        st.markdown("**Result — rows matched on SR No + Date + City + Status:**")
+                        # Annotate result rows
+                        a_keys = set(zip(fa7["SR No"], fa7["Date"], fa7["City"], fa7["Status"]))
+                        b_keys = set(zip(fb7["SR No"], fb7["Date"], fb7["City"], fb7["Status"]))
+                        def _src7(row):
+                            k = (row["SR No"], row["Date"], row["City"], row["Status"])
+                            if k in a_keys and k in b_keys: return "🟡 Both — columns merged"
+                            if k in a_keys:                 return "🟢 File A only"
+                            return                                  "🔵 File B only"
+                        show7 = raw7.copy()
+                        show7.insert(0, "Source", show7.apply(_src7, axis=1))
+                        st.dataframe(show7, use_container_width=True, hide_index=True)
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Input rows (A+B)", len(fa7) + len(fb7))
+                        m2.metric("Output rows", len(raw7))
+                        m3.metric("Rows merged", len(fa7) + len(fb7) - len(raw7))
+                        st.caption(
+                            "🟡 SR001 & SR002 — in both files → merged into one row, "
+                            "ZOHO_Owner + ERP_Code both filled  \n"
+                            "🟢 SR003 — only in File A → kept, ERP_Code = blank  \n"
+                            "🔵 SR004 — only in File B → kept, ZOHO_Owner = blank")
+                except Exception as e:
+                    st.warning(f"Example error: {e}")
+                continue   # skip the standard demo below
+
+            # ── Standard demo for strategies 1–6 ──────────────────────────────
             excl_demo = ["Manager"] if cfg["allows_excl"] else []
             key = "Employee ID" if cfg["needs_key"] else None
             try:
@@ -866,9 +1070,23 @@ with tab_merge:
 
         st.divider()
 
-        # ── Step 2: Sheet groups ───────────────────────────────────────────
-        groups = group_sheets(mapped_triples)
-        st.markdown(f"### Step 2 — Sheet Groups  ({len(groups)} detected)")
+        # ── Step 2: Settings (needed before groups for Strategy 7) ───────────
+        st.markdown("### Step 2 — Merge Settings")
+        all_cols_flat = sorted(
+            set(c for _, _, df in mapped_triples for c in df.columns) - TRACKING_COLS)
+        cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct = \
+            render_settings(all_cols_flat, "upload")
+
+        st.divider()
+
+        # ── Step 3: Sheet groups (respects strategy's grouping mode) ──────────
+        if cfg.get("partial_group"):
+            groups = group_sheets_partial(mapped_triples, threshold=overlap_pct)
+            group_label = f"### Step 3 — Sheet Groups  ({len(groups)} detected — partial overlap ≥{overlap_pct:.0%})"
+        else:
+            groups = group_sheets(mapped_triples)
+            group_label = f"### Step 3 — Sheet Groups  ({len(groups)} detected)"
+        st.markdown(group_label)
         for i, (cols_key, entries) in enumerate(groups):
             file_names  = sorted({e[0] for e in entries})
             sheet_names = sorted({e[1] for e in entries})
@@ -884,14 +1102,6 @@ with tab_merge:
                 f'Files: {", ".join(f[:40] for f in file_names)}</small></div>',
                 unsafe_allow_html=True)
 
-        st.divider()
-
-        # ── Step 3: Settings ───────────────────────────────────────────────
-        st.markdown("### Step 3 — Merge Settings")
-        all_cols = (sorted(set.union(*[set(k) for k, _ in groups]) - TRACKING_COLS)
-                    if groups else [])
-        cfg, key_col, excl_cols, clean_types, add_src, out_fmt = render_settings(
-            all_cols, "upload")
         st.divider()
 
         if st.button("Run Merge", type="primary", use_container_width=True):
@@ -1161,7 +1371,7 @@ with tab_folder:
                         all_folder_cols = sorted(
                             set().union(*[set(e[2].columns)
                                           for e in mapped_triples]) - TRACKING_COLS)
-                        cfg, key_col, excl_cols, clean_types, add_src, out_fmt = \
+                        cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct = \
                             render_settings(all_folder_cols, "folder")
                         st.divider()
 
@@ -1184,7 +1394,9 @@ with tab_folder:
                                     all_triples.append((fname, sname, d))
 
                                 with st.spinner("Merging..."):
-                                    groups            = group_sheets(all_triples)
+                                    groups = (group_sheets_partial(all_triples, overlap_pct)
+                                              if cfg.get("partial_group")
+                                              else group_sheets(all_triples))
                                     new_output_sheets = {}
                                     all_audits        = []
                                     total_in = total_out = 0
