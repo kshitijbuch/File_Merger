@@ -1136,8 +1136,11 @@ with tab_merge:
                         for fname, sname, df in entries:
                             d = df.copy()
                             if add_src:
-                                d.insert(0, "Source File",  fname)
-                                d.insert(1, "Source Sheet", sname)
+                                # Skip if already present (e.g. re-merging a prior output)
+                                if "Source File" not in d.columns:
+                                    d.insert(0, "Source File",  fname)
+                                if "Source Sheet" not in d.columns:
+                                    d.insert(1, "Source Sheet", sname)
                             if clean_types:
                                 d, trpt = clean_dtypes(d)
                                 all_type_reports.extend(trpt)
@@ -1414,8 +1417,11 @@ with tab_folder:
                                 for fname, sname, df in mapped_triples:
                                     d = df.copy()
                                     if add_src:
-                                        d.insert(0, "Source File",  fname)
-                                        d.insert(1, "Source Sheet", sname)
+                                        # Skip if already present (re-merging a prior output)
+                                        if "Source File" not in d.columns:
+                                            d.insert(0, "Source File",  fname)
+                                        if "Source Sheet" not in d.columns:
+                                            d.insert(1, "Source Sheet", sname)
                                     if clean_types:
                                         d, trpt = clean_dtypes(d)
                                         all_type_reports.extend(trpt)
