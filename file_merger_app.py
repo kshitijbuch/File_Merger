@@ -1,8 +1,9 @@
 """
-File Merger Pro — Streamlit application for merging large CSV / Excel files.
-Supports multi-sheet Excel files, column mapping across files with different
-column names, data-type cleaning, duplicate-audit reporting, and an
-interactive dashboard with offline-capable HTML export.
+DataMerge Studio — Streamlit application for merging and joining CSV/Excel files.
+Implements all standard SQL set operations (Union All, Union All Distinct,
+Inner / Left / Right / Full Outer / Cross Join) with column mapping across files
+with different column names, data-type cleaning, duplicate-audit reporting,
+and an interactive dashboard with offline-capable HTML export.
 """
 
 import io, os, re
@@ -24,7 +25,7 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-st.set_page_config(page_title="File Merger Pro", page_icon="🔀",
+st.set_page_config(page_title="DataMerge Studio", page_icon="🔀",
                    layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -52,42 +53,39 @@ REGION_KEYWORDS = {"region","zone","area","territory","state","country"}
 
 # ─── Dummy data (Learn tab) ────────────────────────────────────────────────────
 @st.cache_data
-def get_dummy_partial():
-    """Demo data for Strategy 7 — two sheets with partial column overlap."""
+def get_dummy_join():
+    """Demo data for join strategies — File A = Employees, File B = Payroll."""
     fa = pd.DataFrame({
-        "SR No":      ["SR001", "SR002", "SR003"],
-        "Date":       ["01-Apr", "02-Apr", "03-Apr"],
-        "City":       ["Mumbai", "Delhi",  "Pune"],
-        "Status":     ["Open",   "Closed", "Open"],
-        "ZOHO_Owner": ["Raj",    "Sara",   "Raj"],   # ← only in File A
+        "Employee ID": ["E001", "E002", "E003", "E004", "E005"],
+        "Name":        ["Alice", "Bob", "Charlie", "Diana", "Eve"],
+        "Department":  ["Engineering", "Marketing", "Engineering", "HR", "Finance"],
     })
     fb = pd.DataFrame({
-        "SR No":    ["SR001",   "SR002",   "SR004"],
-        "Date":     ["01-Apr",  "02-Apr",  "04-Apr"],
-        "City":     ["Mumbai",  "Delhi",   "Chennai"],
-        "Status":   ["Open",    "Closed",  "Open"],
-        "ERP_Code": ["ERP-001", "ERP-002", "ERP-004"],  # ← only in File B
+        "Employee ID": ["E003", "E004", "E005", "E006", "E007"],
+        "Salary":      [90000, 71500, 78000, 88000, 76000],
+        "Manager":     ["Tom", "Raj", "Sara", "Raj", "Sara"],
     })
     return fa, fb
 
 
 @st.cache_data
-def get_dummy():
+def get_dummy_union():
+    """Demo data for union strategies — same columns, some duplicate rows."""
     fa = pd.DataFrame({
-        "Employee ID": ["E001","E002","E003","E004","E005"],
-        "Name":        ["Alice","Bob","Charlie","Diana","Eve"],
-        "Department":  ["Engineering","Marketing","Engineering","HR","Finance"],
-        "Salary":      [85000,72000,90000,68000,78000],
-        "Manager":     ["Tom","Sara","Tom","Raj","Sara"],
+        "Order ID":   ["O001", "O002", "O003"],
+        "Customer":   ["Alice", "Bob", "Charlie"],
+        "Amount":     [120, 350, 80],
     })
     fb = pd.DataFrame({
-        "Employee ID": ["E003","E004","E005","E006","E007"],
-        "Name":        ["Charlie","DIANA","Eve","Frank","Grace"],
-        "Department":  ["Engineering","HR","Finance","Finance","Marketing"],
-        "Salary":      [90000,71500,None,88000,76000],
-        "Manager":     ["Tom","Raj","Sara","Raj","Sara"],
+        "Order ID":   ["O003", "O004", "O005"],
+        "Customer":   ["Charlie", "Diana", "Eve"],
+        "Amount":     [80, 200, 150],     # O003 row identical to File A
     })
     return fa, fb
+
+
+# Backwards-compat alias (used by render_dashboard etc.)
+get_dummy = get_dummy_join
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -221,206 +219,172 @@ def show_audit(all_audits):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MERGE STRATEGY FUNCTIONS  — all return (result_df, audit_df)
-# To add a new strategy: write a function here, then add an entry to STRATEGIES.
+# MERGE / JOIN FUNCTIONS  — all return (result_df, audit_df)
+#
+# Standard SQL set operations implemented on top of pandas:
+#   • Union All              → pd.concat
+#   • Union All (Distinct)   → pd.concat → drop_duplicates
+#   • Inner / Left / Right / Full Outer / Cross  → chained pd.merge
+#
+# Multi-file joins are chained left-to-right:  ((A ⨝ B) ⨝ C) ⨝ D ...
+# All operations are pure pandas — no custom logic, fully standard.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def do_append(dfs, key=None, excl=None):
-    return pd.concat(dfs, ignore_index=True), pd.DataFrame()
+EXCEL_ROW_LIMIT = 1_048_576
 
-def do_exact_dedup(dfs, key=None, excl=None):
-    combined = pd.concat(dfs, ignore_index=True)
+
+def do_union_all(dfs, key=None, excl=None):
+    """Stack all rows vertically. Columns aligned by name (outer join on columns)."""
+    return pd.concat(dfs, ignore_index=True, join="outer"), pd.DataFrame()
+
+
+def do_union_distinct(dfs, key=None, excl=None):
+    """Stack vertically, then drop rows where every checked column is identical."""
+    combined = pd.concat(dfs, ignore_index=True, join="outer")
     check = [c for c in combined.columns
              if c not in (excl or set()) and c not in TRACKING_COLS]
     return dedup_with_audit(combined, check)
 
-def do_key_first(dfs, key, excl=None):
-    combined = pd.concat(dfs, ignore_index=True)
-    return dedup_with_audit(combined, [key])
 
-def do_key_last(dfs, key, excl=None):
-    combined = pd.concat(dfs, ignore_index=True)
-    rev      = combined.iloc[::-1].reset_index(drop=True)
-    clean, audit = dedup_with_audit(rev, [key])
-    return clean.iloc[::-1].reset_index(drop=True), audit
+def _chain_join(dfs, key, how):
+    """Chain pd.merge left-to-right. All dfs must contain the key column."""
+    # Validate key column is present everywhere
+    missing = [i + 1 for i, d in enumerate(dfs) if key not in d.columns]
+    if missing:
+        raise ValueError(
+            f"Key column '{key}' is missing in file/sheet #{missing}. "
+            f"Add it (or remap a column to '{key}') before joining.")
 
-def do_smart_fill(dfs, key, excl=None):
-    combined = pd.concat(dfs, ignore_index=True)
-    result   = combined.groupby(key, sort=False, as_index=False).first()
-    cols     = [c for c in combined.columns if c in result.columns]
-    return result[cols].reset_index(drop=True), pd.DataFrame()
-
-def do_intersection(dfs, key, excl=None):
-    sets   = [set(df[key].dropna()) for df in dfs]
-    common = sets[0].intersection(*sets[1:])
-    comb   = pd.concat(dfs, ignore_index=True)
-    sub    = comb[comb[key].isin(common)].reset_index(drop=True)
-    return dedup_with_audit(sub, [key])
+    result = dfs[0].copy()
+    for i, d in enumerate(dfs[1:], start=2):
+        result = pd.merge(
+            result, d, on=key, how=how,
+            suffixes=("", f"__t{i}"))
+    return result
 
 
-def do_partial_merge(dfs, key=None, excl=None):
-    """
-    Strategy 7 — Partial Column Merge.
-    For sheets with ≥85% column overlap (different column SETS, mostly shared):
-      1. Stack all rows with outer join on columns (NaN where a column is absent).
-      2. Match rows that are identical on ALL common columns.
-      3. Smart-Fill: for matched rows keep first non-null value per column.
-      4. Unmatched rows are kept as-is (NaN for columns from the other sheet).
-    No key column needed — the common columns collectively act as row identity.
-    """
+def do_inner_join(dfs, key, excl=None):
+    if not key:
+        raise ValueError("Inner Join requires a key column.")
     if len(dfs) == 1:
         return dfs[0].copy(), pd.DataFrame()
-
-    # Common columns across every df (these are the row-identity fingerprint)
-    all_col_sets = [set(df.columns) - TRACKING_COLS for df in dfs]
-    common_cols  = sorted(set.intersection(*all_col_sets))
-    check_cols   = [c for c in common_cols if c not in (excl or set())]
-
-    # Preserve column order: left-df cols first, then any extra from right dfs
-    all_cols_ordered = list(dfs[0].columns)
-    for df in dfs[1:]:
-        for c in df.columns:
-            if c not in all_cols_ordered:
-                all_cols_ordered.append(c)
-
-    # Stack with outer join (NaN for missing columns)
-    combined = pd.concat(dfs, ignore_index=True, join="outer")
-    before   = len(combined)
-
-    if not check_cols:
-        # Nothing to match on — just stack
-        return combined, pd.DataFrame()
-
-    # Group by common cols; first() returns first non-null per column = Smart Fill
-    try:
-        result = (combined
-                  .groupby(check_cols, sort=False, dropna=False, as_index=False)
-                  .first())
-    except TypeError:           # older pandas without dropna param
-        result = (combined
-                  .groupby(check_cols, sort=False, as_index=False)
-                  .first())
-
-    after       = len(result)
-    n_merged    = before - after
-    final_cols  = [c for c in all_cols_ordered if c in result.columns]
-    result      = result[final_cols].reset_index(drop=True)
-
-    audit = pd.DataFrame()
-    if n_merged > 0:
-        audit = pd.DataFrame({
-            "Removed Row# (Excel)": [f"— ({n_merged} rows absorbed into others)"],
-            "Note": [f"Rows matched on {len(check_cols)} common columns; "
-                     "extra columns Smart-Filled from whichever sheet had the data"],
-        })
-    return result, audit
+    return _chain_join(dfs, key, "inner"), pd.DataFrame()
 
 
-def group_sheets_partial(file_sheet_dfs, threshold=0.85):
-    """
-    Group sheets where column overlap ≥ threshold (Jaccard on column sets).
-    Returns same format as group_sheets: [(union_col_frozenset, [entries]), ...]
-    Uses union-find clustering so transitivity is handled correctly.
-    """
-    sheets   = list(file_sheet_dfs)
-    col_sets = [frozenset(c for c in df.columns if c not in TRACKING_COLS)
-                for _, _, df in sheets]
-    n = len(sheets)
-    parent = list(range(n))
+def do_left_join(dfs, key, excl=None):
+    if not key:
+        raise ValueError("Left Join requires a key column.")
+    if len(dfs) == 1:
+        return dfs[0].copy(), pd.DataFrame()
+    return _chain_join(dfs, key, "left"), pd.DataFrame()
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
 
-    def union(x, y):
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
+def do_right_join(dfs, key, excl=None):
+    if not key:
+        raise ValueError("Right Join requires a key column.")
+    if len(dfs) == 1:
+        return dfs[0].copy(), pd.DataFrame()
+    return _chain_join(dfs, key, "right"), pd.DataFrame()
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            u = len(col_sets[i] | col_sets[j])
-            c = len(col_sets[i] & col_sets[j])
-            if u > 0 and c / u >= threshold:
-                union(i, j)
 
-    clusters = {}
-    for i, sheet in enumerate(sheets):
-        clusters.setdefault(find(i), []).append(sheet)
+def do_full_outer_join(dfs, key, excl=None):
+    if not key:
+        raise ValueError("Full Outer Join requires a key column.")
+    if len(dfs) == 1:
+        return dfs[0].copy(), pd.DataFrame()
+    return _chain_join(dfs, key, "outer"), pd.DataFrame()
 
-    result = []
-    for entries in clusters.values():
-        union_cols = frozenset().union(
-            *[frozenset(c for c in df.columns if c not in TRACKING_COLS)
-              for _, _, df in entries])
-        result.append((union_cols, entries))
 
-    return sorted(result, key=lambda x: -len(x[1]))
+def do_cross_join(dfs, key=None, excl=None):
+    """Cartesian product of all files. Pre-checks against Excel row limit."""
+    if len(dfs) == 1:
+        return dfs[0].copy(), pd.DataFrame()
+    rows = 1
+    for d in dfs:
+        rows *= len(d)
+    if rows > EXCEL_ROW_LIMIT:
+        raise ValueError(
+            f"Cross join would produce {rows:,} rows — exceeds Excel's "
+            f"{EXCEL_ROW_LIMIT:,} row limit. Reduce inputs first.")
+    result = dfs[0].copy()
+    for i, d in enumerate(dfs[1:], start=2):
+        result = pd.merge(
+            result, d, how="cross",
+            suffixes=("", f"__t{i}"))
+    return result, pd.DataFrame()
 
 
 STRATEGIES = {
-    "1 — Simple Append": dict(
-        fn=do_append, needs_key=False, allows_excl=False,
-        merge_all_groups=True,   # ignore column-structure grouping — stack everything
+    "Union All": dict(
+        fn=do_union_all, needs_key=False, allows_excl=False,
+        merge_all_groups=True, family="union",
         icon="➕", badge="badge-blue", badge_lbl="No key needed",
-        head="Stack all rows as-is. Every row kept, including exact duplicates.",
-        detail="No filtering at all. Use when files cover completely different records.",
-        best="Daily exports with no expected overlap.",
+        head="Stack all rows vertically. Every row kept, including duplicates.",
+        detail="Equivalent to SQL `UNION ALL`. Columns are matched by name; "
+               "any column missing in one file becomes blank for that file's rows.",
+        best="Combining periodic exports (e.g. daily/monthly files) that don't overlap.",
     ),
-    "2 — Remove Exact Duplicates": dict(
-        fn=do_exact_dedup, needs_key=False, allows_excl=True,
+    "Union All (Distinct)": dict(
+        fn=do_union_distinct, needs_key=False, allows_excl=True,
+        merge_all_groups=True, family="union",
         icon="🧹", badge="badge-green", badge_lbl="No key · exclude-cols optional",
-        head="Remove rows where every checked column is identical.",
-        detail=("ALL columns must match for a row to be a duplicate. "
-                "Optionally exclude specific columns (e.g. engineer name) from the check — "
-                "so the same call assigned to two engineers is still treated as one record."),
-        best="Two system exports of the same data with minor field differences.",
+        head="Stack all rows vertically, then remove exact-duplicate rows.",
+        detail="Equivalent to SQL `UNION` (which deduplicates by default). "
+               "A row is a duplicate only if EVERY checked column is identical. "
+               "You can optionally exclude specific columns from the duplicate "
+               "check (e.g. an 'Assigned To' column where minor differences "
+               "shouldn't prevent two rows being treated as the same).",
+        best="Two exports of the same data with minor irrelevant field differences.",
     ),
-    "3 — Key Dedup: First File Wins": dict(
-        fn=do_key_first, needs_key=True, allows_excl=False,
-        icon="1️⃣", badge="badge-green", badge_lbl="Key column required",
-        head="When a key repeats across files, keep the FIRST file's version.",
-        detail="All unique keys are kept; only the first-uploaded version survives for duplicates.",
-        best="First file is the authoritative master source.",
+    "Inner Join": dict(
+        fn=do_inner_join, needs_key=True, allows_excl=False,
+        merge_all_groups=True, family="join",
+        icon="🔍", badge="badge-purple", badge_lbl="Key column required",
+        head="Keep only rows whose key exists in EVERY file. Columns combined.",
+        detail="Equivalent to SQL `INNER JOIN`. For each matching key, columns "
+               "from all files are placed side-by-side. Rows whose key appears "
+               "in only some files are dropped.",
+        best="Records confirmed in every source — e.g. customers active in both Jan and Feb.",
     ),
-    "4 — Key Dedup: Last File Wins": dict(
-        fn=do_key_last, needs_key=True, allows_excl=False,
-        icon="🔄", badge="badge-orange", badge_lbl="Key column required",
-        head="When a key repeats across files, keep the LAST file's version.",
-        detail="Same as option 3 but the most recently uploaded file's version is kept.",
-        best="Latest file has the freshest data.",
+    "Left Join": dict(
+        fn=do_left_join, needs_key=True, allows_excl=False,
+        merge_all_groups=True, family="join",
+        icon="⬅️", badge="badge-teal", badge_lbl="Key column required",
+        head="Keep ALL rows from the FIRST file. Match rows from later files.",
+        detail="Equivalent to SQL `LEFT JOIN`. Every row from File 1 is kept; "
+               "matching data from File 2/3/... is added on the right (NULL "
+               "where no match). Rows unique to later files are dropped.",
+        best="Enriching a master list (File 1) with extra info from another file.",
     ),
-    "5 — Smart Fill (Best of Both)": dict(
-        fn=do_smart_fill, needs_key=True, allows_excl=False,
-        icon="🧩", badge="badge-purple", badge_lbl="Key column required",
-        head="For duplicate keys, fill empty cells from the other file.",
-        detail="First non-empty value per column wins. Upload authoritative file first.",
-        best="Two systems each export partial data for the same records.",
+    "Right Join": dict(
+        fn=do_right_join, needs_key=True, allows_excl=False,
+        merge_all_groups=True, family="join",
+        icon="➡️", badge="badge-orange", badge_lbl="Key column required",
+        head="Keep ALL rows from the LAST file. Match rows from earlier files.",
+        detail="Equivalent to SQL `RIGHT JOIN`. Mirror image of Left Join — "
+               "every row from the last file is kept; matching data from earlier "
+               "files is added on the left (NULL where no match).",
+        best="When the latest file is the source of truth.",
     ),
-    "6 — Intersection Only": dict(
-        fn=do_intersection, needs_key=True, allows_excl=False,
-        icon="🔍", badge="badge-red", badge_lbl="Key column required",
-        head="Keep ONLY records whose key exists in EVERY uploaded file.",
-        detail="Records unique to any single file are excluded entirely.",
-        best="Records confirmed across all sources.",
+    "Full Outer Join": dict(
+        fn=do_full_outer_join, needs_key=True, allows_excl=False,
+        merge_all_groups=True, family="join",
+        icon="🔗", badge="badge-red", badge_lbl="Key column required",
+        head="Keep EVERY row from EVERY file. Pair up where the key matches.",
+        detail="Equivalent to SQL `FULL OUTER JOIN`. Nothing is dropped. "
+               "Rows that share a key in multiple files are combined into one row. "
+               "Rows unique to any file appear with NULLs for the other files' columns.",
+        best="Building a complete master list from disparate sources.",
     ),
-    "7 — Partial Column Merge": dict(
-        fn=do_partial_merge, needs_key=False, allows_excl=False,
-        partial_group=True,
-        icon="🔗", badge="badge-teal", badge_lbl="No key · overlap % configurable",
-        head="Merge sheets that share ≥85% of columns — even if column sets differ.",
-        detail=(
-            "Sheets with mostly-common columns are grouped together (configurable threshold). "
-            "Rows are matched on ALL shared columns acting as a composite fingerprint. "
-            "Matched rows are Smart-Filled (first non-null per column wins). "
-            "Unmatched rows are kept with NaN for columns absent in their source sheet. "
-            "No primary-key column needed — works on any data where common columns "
-            "together uniquely identify a record."
-        ),
-        best="Two systems (e.g. ZOHO + ERP) export mostly the same records with "
-             "slightly different column sets and matching SR/ticket numbers.",
+    "Cross Join": dict(
+        fn=do_cross_join, needs_key=False, allows_excl=False,
+        merge_all_groups=True, family="join",
+        icon="✖️", badge="badge-red", badge_lbl="No key · cartesian product",
+        head="Pair every row of File 1 with every row of File 2 (×3, ×4...).",
+        detail="Equivalent to SQL `CROSS JOIN`. Produces N₁ × N₂ × ... rows. "
+               "Use sparingly — easily exceeds Excel's 1,048,576 row limit. "
+               "App pre-checks the row count and refuses if too large.",
+        best="Generating all combinations (e.g. every product × every region).",
     ),
 }
 
@@ -466,56 +430,57 @@ def annotate(fa, fb, result, key):
 def make_venn_fig(strategy_name):
     C = dict(a="#4ade80", b="#60a5fa", both="#fbbf24", fill="#c084fc", gray="#e5e7eb")
     CFGS = {
-        "1 — Simple Append": dict(
+        "Union All": dict(
             c10=C["a"], c11=C["both"], c01=C["b"],
-            l10="E001\nE002", l11="E003\nE004\nE005\n(×2 copies)", l01="E006\nE007",
-            title="Simple Append",
-            desc="All rows kept — every duplicate appears twice",
-            rows="10 rows out (5 + 5, nothing removed)",
+            l10="O001\nO002", l11="O003\n(×2 copies)", l01="O004\nO005",
+            title="Union All — vertical stack",
+            desc="All rows from all files kept (duplicates included)",
+            rows="6 rows out (3 + 3, nothing removed)",
         ),
-        "2 — Remove Exact Duplicates": dict(
+        "Union All (Distinct)": dict(
             c10=C["a"], c11=C["both"], c01=C["b"],
-            l10="E001\nE002",
-            l11="E003 → 1 copy\n(exact dup)\nE004 & E005\n→ both kept\n(data differs)",
-            l01="E006\nE007",
-            title="Remove Exact Duplicates",
-            desc="Only rows identical in EVERY column are collapsed to one copy",
-            rows="9 rows out (E003 collapsed; E004 & E005 differ so both kept)",
+            l10="O001\nO002", l11="O003\n(1 copy)", l01="O004\nO005",
+            title="Union All (Distinct) — stack then dedupe",
+            desc="Stack vertically, then drop rows identical in every column",
+            rows="5 rows out (O003 collapsed; differing rows kept)",
         ),
-        "3 — Key Dedup: First File Wins": dict(
-            c10=C["a"], c11=C["a"], c01=C["b"],
-            l10="E001\nE002", l11="File A\nwins\nE003,E004\nE005", l01="E006\nE007",
-            title="Key Dedup — First File Wins",
-            desc="Shared keys → File A's row is kept; File B's version is discarded",
-            rows="7 rows out (1 row per unique key; intersection = File A version)",
-        ),
-        "4 — Key Dedup: Last File Wins": dict(
-            c10=C["a"], c11=C["b"], c01=C["b"],
-            l10="E001\nE002", l11="File B\nwins\nE003,E004\nE005", l01="E006\nE007",
-            title="Key Dedup — Last File Wins",
-            desc="Shared keys → File B's row is kept; File A's version is discarded",
-            rows="7 rows out (1 row per unique key; intersection = File B version)",
-        ),
-        "5 — Smart Fill (Best of Both)": dict(
-            c10=C["a"], c11=C["fill"], c01=C["b"],
-            l10="E001\nE002", l11="Merged\nE003,E004\nE005\n(gaps filled)", l01="E006\nE007",
-            title="Smart Fill (Best of Both)",
-            desc="Shared keys → row assembled from first non-empty value across files",
-            rows="7 rows out (E005 salary: None→78000 filled from File A)",
-        ),
-        "6 — Intersection Only": dict(
+        "Inner Join": dict(
             c10=C["gray"], c11=C["both"], c01=C["gray"],
-            l10="E001,E002\nexcluded", l11="E003\nE004\nE005", l01="E006,E007\nexcluded",
-            title="Intersection Only",
-            desc="Only records whose key exists in ALL files are kept",
-            rows="3 rows out (only E003, E004, E005 appear in both files)",
+            l10="E001,E002\ndropped", l11="E003\nE004\nE005", l01="E006,E007\ndropped",
+            title="Inner Join — intersection",
+            desc="Only keys present in BOTH files survive; columns combined",
+            rows="3 rows out (E003, E004, E005 with combined columns)",
         ),
-        "7 — Partial Column Merge": dict(
-            c10="#99f6e4", c11="#5eead4", c01="#99f6e4",
-            l10="ZOHO_Owner\n(File A col)", l11="SR No\nDate\nCity\nStatus\n(4 shared)", l01="ERP_Code\n(File B col)",
-            title="Partial Column Merge (≥85% overlap)",
-            desc="Rows matched on shared columns — extra columns filled from each source",
-            rows="4 rows out: SR001+SR002 merged, SR003 (A only), SR004 (B only)",
+        "Left Join": dict(
+            c10=C["a"], c11=C["both"], c01=C["gray"],
+            l10="E001,E002\n(no match)", l11="E003,E004\nE005\n(matched)",
+            l01="E006,E007\ndropped",
+            title="Left Join — keep File A",
+            desc="All File A rows kept; File B columns added where key matches",
+            rows="5 rows out (E001/E002 have NULLs for File B columns)",
+        ),
+        "Right Join": dict(
+            c10=C["gray"], c11=C["both"], c01=C["b"],
+            l10="E001,E002\ndropped", l11="E003,E004\nE005\n(matched)",
+            l01="E006,E007\n(no match)",
+            title="Right Join — keep File B",
+            desc="All File B rows kept; File A columns added where key matches",
+            rows="5 rows out (E006/E007 have NULLs for File A columns)",
+        ),
+        "Full Outer Join": dict(
+            c10=C["a"], c11=C["both"], c01=C["b"],
+            l10="E001,E002", l11="E003,E004\nE005", l01="E006,E007",
+            title="Full Outer Join — keep everything",
+            desc="Every row from every file kept; matched rows combined",
+            rows="7 rows out (5 + 5 minus 3 matches; NULLs where no match)",
+        ),
+        "Cross Join": dict(
+            c10=C["a"], c11=C["fill"], c01=C["b"],
+            l10="A1×B1,A1×B2,…", l11="every A\n×\nevery B",
+            l01="A5×B1,A5×B2,…",
+            title="Cross Join — cartesian product",
+            desc="Every row of File A paired with every row of File B",
+            rows="N₁ × N₂ rows (5 × 5 = 25 rows here)",
         ),
     }
     cfg = CFGS.get(strategy_name)
@@ -629,9 +594,23 @@ def render_column_mapping(all_triples, tab_key="upload"):
     form_key = f"col_mapping_form_{tab_key}"
 
     file_cols = {}
+    # Also keep a sample-values map: {fname: {col: [first 10 non-null values]}}
+    file_samples = {}
     for fname, _sname, df in all_triples:
         file_cols.setdefault(fname, set()).update(
             c for c in df.columns if c not in TRACKING_COLS)
+        for c in df.columns:
+            if c in TRACKING_COLS:
+                continue
+            try:
+                series = df[c]
+                if isinstance(series, pd.DataFrame):
+                    continue
+                vals = series.dropna().astype(str).head(10).tolist()
+            except Exception:
+                vals = []
+            # Only set the first time we see this (file, col) pair
+            file_samples.setdefault(fname, {}).setdefault(c, vals)
 
     fnames = list(file_cols.keys())
     if len(fnames) < 2:
@@ -641,8 +620,27 @@ def render_column_mapping(all_triples, tab_key="upload"):
     common     = set.intersection(*file_cols.values())
     unmatched  = sorted(all_unique - common)
 
+    # ── ALWAYS show a "data sample preview" panel for ALL columns ─────────
+    # This is the key UX upgrade — user can verify column meaning without
+    # opening files separately.
+    with st.expander(
+            f"🔍 Preview column contents — {len(all_unique)} unique column(s) across all files",
+            expanded=False):
+        st.caption(
+            "First 10 non-null sample values from each file. "
+            "Use this to verify two differently-named columns "
+            "(e.g. 'SR No' vs 'Ser Num') actually contain the same kind of data.")
+        for col in sorted(all_unique):
+            present_in = [f for f in fnames if col in file_cols[f]]
+            st.markdown(f"**`{col}`**  — in {len(present_in)} of {len(fnames)} file(s)")
+            for f in present_in:
+                samples = file_samples.get(f, {}).get(col, [])
+                sample_str = ", ".join(samples[:10]) if samples else "_(all null)_"
+                st.caption(f"  📄 `{os.path.basename(f)[:35]}`: {sample_str}")
+            st.markdown("")
+
     if not unmatched:
-        st.success("All files share identical column names — no mapping needed.")
+        st.success("✅ All files share identical column names — no mapping needed.")
         st.session_state[ss_key] = {}
         return {}
 
@@ -660,6 +658,9 @@ def render_column_mapping(all_triples, tab_key="upload"):
 
     with st.form(form_key):
         st.markdown("**Column Alignment — assign canonical names:**")
+        st.caption(
+            "💡 Tip: expand the *Preview column contents* panel above to see actual "
+            "sample values for each column before deciding which ones should be merged.")
         rows_data = []
         for col in unmatched:
             present_in = [os.path.basename(f)[:28] for f in fnames if col in file_cols[f]]
@@ -674,6 +675,17 @@ def render_column_mapping(all_triples, tab_key="upload"):
                     break
             canonical = st.text_input(label, value=prev_canonical,
                                       key=f"cmap_{tab_key}_{col}")
+            # Inline samples for this column from the file(s) that have it
+            sample_lines = []
+            for f in fnames:
+                if col in file_cols[f]:
+                    smp = file_samples.get(f, {}).get(col, [])
+                    if smp:
+                        sample_lines.append(
+                            f"  📄 `{os.path.basename(f)[:30]}`: "
+                            + ", ".join(smp[:10]))
+            if sample_lines:
+                st.caption("\n".join(sample_lines))
             rows_data.append((col, [f for f in fnames if col in file_cols[f]], canonical.strip()))
 
         submitted = st.form_submit_button(
@@ -707,33 +719,38 @@ def apply_renames_to_triples(triples, renames_map):
 # SHARED SETTINGS WIDGET
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_settings(all_cols, tab_key):
+def render_settings(all_cols, tab_key, mapped_triples=None):
+    """
+    Render the Merge Settings widget AND a 5-row output preview at the bottom.
+    mapped_triples (optional): list of (fname, sname, df) used to generate
+    a small preview of what the chosen operation would produce.
+    """
     col_l, col_r = st.columns(2)
     with col_l:
+        st.markdown("**Operation**  — pick how to combine the files")
+        # Group by family with a divider for clarity
+        strat_list = list(STRATEGIES.keys())
         chosen = st.selectbox(
-            "Merge strategy  (7 options — scroll dropdown to see all)",
-            list(STRATEGIES.keys()),
+            "Merge / Join operation",
+            strat_list,
             key=f"strat_{tab_key}",
-            help="All 7 strategies are in the list. "
-                 "Option 1 — Simple Append is at the top if you scroll up.")
+            help="Union All / Distinct = stack rows vertically.  "
+                 "Inner / Left / Right / Full Outer Join = combine rows side-by-side "
+                 "on a shared key column.  Cross Join = every-pair cartesian product.")
         cfg = STRATEGIES[chosen]
         st.markdown(f'<span class="badge {cfg["badge"]}">{cfg["badge_lbl"]}</span>',
                     unsafe_allow_html=True)
         st.caption(cfg["head"])
-        overlap_pct = 0.85
-        if cfg.get("partial_group"):
-            overlap_pct = st.slider(
-                "Minimum column overlap %",
-                min_value=50, max_value=100, value=85, step=5,
-                key=f"overlap_{tab_key}",
-                help="Sheets whose column sets share at least this % of columns "
-                     "(measured as common ÷ union) are grouped together for partial merge. "
-                     "Default 85% — lower it if your files differ more.") / 100.0
+        family_lbl = "🔵 Vertical stacking (Union)" if cfg["family"] == "union" \
+                     else "🔗 Horizontal combination (Join)"
+        st.caption(f"_{family_lbl}_")
     with col_r:
         key_col, excl_cols = None, []
         if cfg["needs_key"] and all_cols:
-            key_col = st.selectbox("Key column", sorted(all_cols),
-                                   key=f"key_{tab_key}")
+            key_col = st.selectbox(
+                "Key column  — must exist in every file (use column mapping above to align names)",
+                sorted(all_cols),
+                key=f"key_{tab_key}")
         if cfg["allows_excl"] and all_cols:
             excl_cols = st.multiselect(
                 "Columns to IGNORE during duplicate check (optional)",
@@ -748,7 +765,40 @@ def render_settings(all_cols, tab_key):
         out_fmt = st.radio("Download format",
                            ["Excel (.xlsx) — multi-sheet", "CSV (.csv) — first sheet only"],
                            key=f"fmt_{tab_key}", horizontal=True)
-    return cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct
+
+    # ── 5-row output preview ───────────────────────────────────────────────
+    if mapped_triples:
+        with st.expander(
+                f"👀 Preview — what '{chosen}' will produce (first 5 rows)",
+                expanded=True):
+            try:
+                # Build small input samples (first 5 rows of each sheet)
+                sample_dfs = []
+                for _, _, df in mapped_triples:
+                    d = _dedup_columns(df.copy().head(50))   # cap at 50 input rows per sheet
+                    sample_dfs.append(d)
+                if cfg["needs_key"] and not key_col:
+                    st.caption("⚠️ Select a key column above to see preview.")
+                else:
+                    preview, _ = cfg["fn"](sample_dfs,
+                                           key=key_col,
+                                           excl=set(excl_cols) if excl_cols else None)
+                    st.dataframe(preview.head(5), use_container_width=True,
+                                 hide_index=True)
+                    st.caption(
+                        f"Preview built from first 50 rows of each sheet → "
+                        f"{len(preview):,} preview-rows produced.  "
+                        f"The actual run uses your full data.")
+                    if len(preview) == 0:
+                        st.warning(
+                            "⚠️ Preview is empty. This usually means the join "
+                            "key doesn't match between files. Check that the "
+                            "key column has matching values, or revisit the "
+                            "Column Alignment step above.")
+            except Exception as e:
+                st.caption(f"Preview unavailable: {e}")
+
+    return cfg, key_col, excl_cols, clean_types, add_src, out_fmt
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -768,7 +818,7 @@ def render_dashboard():
     sheet_names = list(sheets.keys())
     sel = (st.selectbox("Sheet to analyse", sheet_names, key="dash_sheet")
            if len(sheet_names) > 1 else sheet_names[0])
-    df = sheets[sel].copy()
+    df = _dedup_columns(sheets[sel].copy())
 
     # ── Summary metrics ───────────────────────────────────────────────────────
     st.subheader("Summary")
@@ -782,13 +832,38 @@ def render_dashboard():
     c5.metric("Avg missing",   f"{df.isnull().mean().mean():.1%}")
     st.divider()
 
-    # Auto-detect column types
-    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
-    num_cols  = [c for c in df.columns
-                 if pd.api.types.is_numeric_dtype(df[c]) and c not in TRACKING_COLS]
-    cat_cols  = [c for c in df.columns
-                 if df[c].dtype == object and 1 < df[c].nunique() <= 40
-                 and c not in TRACKING_COLS]
+    # Auto-detect column types (defensively — skip cols where df[c] returns DataFrame)
+    def _safe_col(c):
+        try:
+            s = df[c]
+            return None if isinstance(s, pd.DataFrame) else s
+        except Exception:
+            return None
+
+    date_cols, num_cols, cat_cols = [], [], []
+    for c in df.columns:
+        if c in TRACKING_COLS:
+            continue
+        s = _safe_col(c)
+        if s is None:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(s):
+            date_cols.append(c)
+        elif pd.api.types.is_numeric_dtype(s):
+            num_cols.append(c)
+        elif s.dtype == object and 1 < s.nunique() <= 40:
+            cat_cols.append(c)
+
+    # If nothing chart-worthy was found, tell the user clearly
+    if not (date_cols or num_cols or cat_cols or ("Source File" in df.columns)):
+        st.info(
+            "📊 **No charts produced — your data doesn't have enough variability "
+            "to build a meaningful dashboard.**  \n"
+            "DataMerge Studio looks for: dates (for trend lines), numeric columns "
+            "(for distributions), categorical columns with 2–40 unique values "
+            "(for breakdowns), or a 'Source File' column (for record counts).  \n"
+            "Your data has none of these. The summary metrics above are still valid.")
+        return
 
     figs_for_export = []   # (title, plotly_fig)
 
@@ -913,7 +988,7 @@ def render_dashboard():
                 "<style>body{font-family:sans-serif;margin:32px;background:#f9fafb;}"
                 "h1{color:#1e3a5f;}h2{color:#374151;margin-top:32px;}"
                 "p{color:#6b7280;}</style></head><body>",
-                f"<h1>File Merger Pro — Dashboard</h1>",
+                f"<h1>DataMerge Studio — Dashboard</h1>",
                 f"<p><b>Sheet:</b> {sel} &nbsp;|&nbsp; "
                 f"<b>Rows:</b> {len(df):,} &nbsp;|&nbsp; "
                 f"<b>Columns:</b> {len(df.columns)}</p>",
@@ -939,36 +1014,66 @@ def render_dashboard():
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("File Merger Pro")
+st.title("🔀 DataMerge Studio")
 st.markdown(
-    "Merge large **CSV or Excel** files — including **multi-sheet** workbooks. "
-    "Sheets with identical column structures are merged; those with different "
-    "structures become separate output sheets automatically.")
+    "Combine **CSV or Excel** files — including **multi-sheet** workbooks — "
+    "using all standard SQL set operations: **Union All**, **Inner / Left / Right / "
+    "Full Outer / Cross Join**. Includes column mapping, data-type cleaning, "
+    "duplicate audit, and an interactive dashboard.")
 st.divider()
 
 tab_learn, tab_upload, tab_merge, tab_folder, tab_dash = st.tabs(
-    ["Learn Merge Types", "Upload Files", "Merge & Download", "Folder Mode", "📊 Dashboard"])
+    ["📚 Learn Merge & Joins", "📁 Upload Files",
+     "🔀 Merge & Download", "📂 Folder Mode", "📊 Dashboard"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — LEARN
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_learn:
-    st.subheader("Which merge type do you need?")
-    fa, fb = get_dummy()
+    st.subheader("Merge vs. Join — what's the difference?")
+    st.markdown(
+        "**Merge (Union)** stacks rows **vertically** — combines files into a "
+        "longer list. Use when files have the same kind of records.  \n"
+        "**Join** combines rows **horizontally** by matching on a shared key column — "
+        "puts related data side-by-side. Use when each file has different details "
+        "about the same entities.")
+    st.divider()
+
+    st.markdown("### 🔵 Union family — vertical stacking")
+    st.markdown(
+        "Use the **Orders** demo data below. Both files have the same columns.")
+    fau, fbu = get_dummy_union()
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**File A** — HR System (5 rows)")
+        st.markdown("**File A** — Orders (Jan)")
+        st.dataframe(fau, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("**File B** — Orders (Feb)")
+        st.dataframe(fbu, use_container_width=True, hide_index=True)
+    st.info(
+        "• **O003** — identical row appears in both files (true duplicate)  \n"
+        "• **O001, O002** unique to File A   •   **O004, O005** unique to File B")
+    st.divider()
+
+    st.markdown("### 🔗 Join family — horizontal combination")
+    st.markdown(
+        "Use the **Employees** demo data below. Both files share `Employee ID`. "
+        "File A has names/departments; File B has salaries/managers — joins put them side-by-side.")
+    fa, fb = get_dummy_join()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**File A** — Employees (5 rows)")
         st.dataframe(fa, use_container_width=True, hide_index=True)
     with c2:
-        st.markdown("**File B** — Payroll System (5 rows)")
+        st.markdown("**File B** — Payroll (5 rows)")
         st.dataframe(fb, use_container_width=True, hide_index=True)
     st.info(
-        "• **E003/Charlie** — exact duplicate (every column identical in both files)\n"
-        "• **E004/Diana** — same ID, but name case and salary differ — NOT a duplicate\n"
-        "• **E005/Eve** — same ID, File B has missing salary — NOT a duplicate\n"
-        "• **E001,E002** unique to File A   •   **E006,E007** unique to File B")
+        "• Keys **E003, E004, E005** appear in both files (matches)  \n"
+        "• **E001, E002** only in File A   •   **E006, E007** only in File B")
     st.divider()
+
+    st.markdown("### Detailed walk-through — click any operation to expand")
 
     for name, cfg in STRATEGIES.items():
         with st.expander(f"{cfg['icon']}  **{name}**", expanded=False):
@@ -977,60 +1082,23 @@ with tab_learn:
             st.markdown(f"**{cfg['head']}**\n\n{cfg['detail']}")
             st.markdown(f"*Best for: {cfg['best']}*")
 
-            # ── Strategy 7 gets its own demo data with partial column overlap ──
-            if cfg.get("partial_group"):
-                fa7, fb7 = get_dummy_partial()
-                common_cols = sorted(set(fa7.columns) & set(fb7.columns))
-                overlap_pct_demo = len(common_cols) / len(set(fa7.columns) | set(fb7.columns))
-                try:
-                    raw7, _ = cfg["fn"]([fa7.copy(), fb7.copy()])
-                    col_v, col_t = st.columns([1, 1.4])
-                    with col_v:
-                        fig = make_venn_fig(name)
-                        if fig:
-                            st.pyplot(fig, use_container_width=True)
-                            plt.close(fig)
-                        st.caption(
-                            f"Venn shows **columns** (not records): "
-                            f"{len(common_cols)} shared, 1 unique to each file. "
-                            f"Overlap = {overlap_pct_demo:.0%}")
-                    with col_t:
-                        st.markdown("**File A** — System A (4 common cols + ZOHO_Owner)")
-                        st.dataframe(fa7, use_container_width=True, hide_index=True)
-                        st.markdown("**File B** — System B (4 common cols + ERP_Code)")
-                        st.dataframe(fb7, use_container_width=True, hide_index=True)
-                        st.markdown("**Result — rows matched on SR No + Date + City + Status:**")
-                        # Annotate result rows
-                        a_keys = set(zip(fa7["SR No"], fa7["Date"], fa7["City"], fa7["Status"]))
-                        b_keys = set(zip(fb7["SR No"], fb7["Date"], fb7["City"], fb7["Status"]))
-                        def _src7(row):
-                            k = (row["SR No"], row["Date"], row["City"], row["Status"])
-                            if k in a_keys and k in b_keys: return "🟡 Both — columns merged"
-                            if k in a_keys:                 return "🟢 File A only"
-                            return                                  "🔵 File B only"
-                        show7 = raw7.copy()
-                        show7.insert(0, "Source", show7.apply(_src7, axis=1))
-                        st.dataframe(show7, use_container_width=True, hide_index=True)
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Input rows (A+B)", len(fa7) + len(fb7))
-                        m2.metric("Output rows", len(raw7))
-                        m3.metric("Rows merged", len(fa7) + len(fb7) - len(raw7))
-                        st.caption(
-                            "🟡 SR001 & SR002 — in both files → merged into one row, "
-                            "ZOHO_Owner + ERP_Code both filled  \n"
-                            "🟢 SR003 — only in File A → kept, ERP_Code = blank  \n"
-                            "🔵 SR004 — only in File B → kept, ZOHO_Owner = blank")
-                except Exception as e:
-                    st.warning(f"Example error: {e}")
-                continue   # skip the standard demo below
+            # Pick the right demo data + key per family
+            if cfg["family"] == "union":
+                dfa, dfb, key = fau.copy(), fbu.copy(), None
+                excl_demo = None
+            else:  # join family
+                dfa, dfb, key = fa.copy(), fb.copy(), "Employee ID"
+                excl_demo = None
 
-            # ── Standard demo for strategies 1–6 ──────────────────────────────
-            excl_demo = ["Manager"] if cfg["allows_excl"] else []
-            key = "Employee ID" if cfg["needs_key"] else None
             try:
-                raw, _ = cfg["fn"]([fa.copy(), fb.copy()],
-                                   key=key, excl=excl_demo or None)
-                show = annotate(fa, fb, raw, key)
+                if name == "Cross Join":
+                    # Small subset to avoid 25-row display
+                    raw, _ = cfg["fn"]([dfa.head(2), dfb.head(2)])
+                    cap = "Showing first 2 rows of each → 2×2 = 4 output rows for clarity."
+                else:
+                    raw, _ = cfg["fn"]([dfa, dfb], key=key, excl=excl_demo)
+                    cap = ""
+
                 col_v, col_t = st.columns([1, 1.4])
                 with col_v:
                     fig = make_venn_fig(name)
@@ -1039,13 +1107,12 @@ with tab_learn:
                         plt.close(fig)
                 with col_t:
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Input (A+B)", len(fa) + len(fb))
-                    m2.metric("Output", len(raw))
-                    m3.metric("Removed", len(fa) + len(fb) - len(raw))
-                    if excl_demo:
-                        st.caption(f"Example excludes **Manager** from duplicate check.")
-                    st.dataframe(show, use_container_width=True, hide_index=True)
-                    st.caption("🟢 File A only   🔵 File B only   🟡 Both files")
+                    m1.metric("Input (A+B)", len(dfa) + len(dfb))
+                    m2.metric("Output rows", len(raw))
+                    m3.metric("Output cols", len(raw.columns))
+                    if cap:
+                        st.caption(cap)
+                    st.dataframe(raw, use_container_width=True, hide_index=True)
             except Exception as e:
                 st.warning(f"Example error: {e}")
 
@@ -1057,8 +1124,41 @@ with tab_upload:
     st.subheader("Upload Your Files")
     st.markdown(
         "Upload **2 or more** CSV or Excel files. "
-        "**Multi-sheet workbooks are fully supported** — all sheets are read and "
-        "automatically grouped by column structure.")
+        "**Multi-sheet workbooks are fully supported** — all sheets are read.")
+
+    # ── New Session button — clears all session state with confirmation ─────
+    _has_run = bool(st.session_state.get("_last_run"))
+    _hdr_l, _hdr_r = st.columns([4, 1])
+    with _hdr_r:
+        if _has_run:
+            if st.session_state.get("_confirm_new_session"):
+                st.warning("Sure? This clears all current results.")
+                _yes, _no = st.columns(2)
+                if _yes.button("✅ Yes, reset", key="confirm_yes",
+                               use_container_width=True):
+                    # Clear everything related to a run
+                    for _k in ("uf", "_last_run", "_upload_dl", "_folder_dl",
+                               "merged_sheets", "_folder_read_key",
+                               "_folder_triples", "_folder_read_errors",
+                               "_confirm_new_session"):
+                        st.session_state.pop(_k, None)
+                    # Also clear col mapping & widget state
+                    for _k in list(st.session_state.keys()):
+                        if _k.startswith(("col_renames_", "cmap_", "strat_",
+                                          "key_", "excl_", "clean_", "src_",
+                                          "fmt_", "fc_")):
+                            st.session_state.pop(_k, None)
+                    st.rerun()
+                if _no.button("Cancel", key="confirm_no",
+                              use_container_width=True):
+                    st.session_state.pop("_confirm_new_session", None)
+                    st.rerun()
+            else:
+                if st.button("🔄 New Session", key="new_session_btn",
+                             use_container_width=True,
+                             help="Clear all uploaded files, mappings, and results."):
+                    st.session_state["_confirm_new_session"] = True
+                    st.rerun()
     uploaded = st.file_uploader(
         "Drag & drop files here, or click Browse",
         type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="uploader")
@@ -1123,32 +1223,29 @@ with tab_merge:
 
         st.divider()
 
-        # ── Step 2: Settings (needed before groups for Strategy 7) ───────────
+        # ── Step 2: Settings (with live preview) ──────────────────────────
         st.markdown("### Step 2 — Merge Settings")
         all_cols_flat = sorted(
             set(c for _, _, df in mapped_triples for c in df.columns) - TRACKING_COLS)
-        cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct = \
-            render_settings(all_cols_flat, "upload")
+        cfg, key_col, excl_cols, clean_types, add_src, out_fmt = \
+            render_settings(all_cols_flat, "upload", mapped_triples=mapped_triples)
 
         st.divider()
 
-        # ── Step 3: Sheet groups (respects strategy's grouping mode) ──────────
-        if cfg.get("partial_group"):
-            groups = group_sheets_partial(mapped_triples, threshold=overlap_pct)
-            group_label = f"### Step 3 — Sheet Groups  ({len(groups)} detected — partial overlap ≥{overlap_pct:.0%})"
-        else:
-            groups = group_sheets(mapped_triples)
-            group_label = f"### Step 3 — Sheet Groups  ({len(groups)} detected)"
-
-        # Simple Append: collapse all column-groups into one so every file lands
-        # in a single output sheet (missing columns get NaN, nothing is dropped)
+        # ── Step 3: Sheet groups ──────────────────────────────────────────
+        # All standard ops use merge_all_groups=True → every sheet from every
+        # file participates in ONE combined operation (chained join, or stack).
+        groups = group_sheets(mapped_triples)
         if cfg.get("merge_all_groups") and len(groups) > 1:
             _all_entries = [e for _, entries in groups for e in entries]
             _union_cols  = frozenset(c for _, _, df in _all_entries
                                      for c in df.columns if c not in TRACKING_COLS)
             groups     = [(_union_cols, _all_entries)]
             group_label = (f"### Step 3 — Sheet Groups  "
-                           f"(1 group — all {len(_all_entries)} sheet(s) stacked into one output)")
+                           f"(1 group — all {len(_all_entries)} sheet(s) participate "
+                           f"in one combined output)")
+        else:
+            group_label = f"### Step 3 — Sheet Groups  ({len(groups)} detected)"
 
         st.markdown(group_label)
         for i, (cols_key, entries) in enumerate(groups):
@@ -1228,7 +1325,22 @@ with tab_merge:
                     "type_reports":  sorted(set(all_type_reports)),
                     "audits":        all_audits,
                     "output_sheets": output_sheets,
+                    "operation":     list(STRATEGIES.keys())[
+                        list(STRATEGIES.values()).index(cfg)],
+                    "key_col":       key_col,
                 }
+
+                # Zero-row warning — most commonly a join key mismatch
+                if total_out == 0 and cfg["family"] == "join":
+                    st.error(
+                        f"⚠️ Your **{list(STRATEGIES.keys())[list(STRATEGIES.values()).index(cfg)]}** "
+                        f"produced **0 rows** — this almost always means the key column "
+                        f"'`{key_col}`' has **no matching values across files**.  \n"
+                        f"Check that:\n"
+                        f"- The values in '{key_col}' actually overlap between files "
+                        f"(e.g. `E001` vs `e001` won't match — case matters)\n"
+                        f"- You haven't mapped two genuinely different columns to the same name\n"
+                        f"- Try `Full Outer Join` first to see all rows side by side")
 
     # ── Persistent results — shown until user explicitly runs a new merge ─
     # Lives OUTSIDE the if/else so it survives every widget interaction.
@@ -1459,8 +1571,9 @@ with tab_folder:
                         all_folder_cols = sorted(
                             set().union(*[set(e[2].columns)
                                           for e in mapped_triples]) - TRACKING_COLS)
-                        cfg, key_col, excl_cols, clean_types, add_src, out_fmt, overlap_pct = \
-                            render_settings(all_folder_cols, "folder")
+                        cfg, key_col, excl_cols, clean_types, add_src, out_fmt = \
+                            render_settings(all_folder_cols, "folder",
+                                            mapped_triples=mapped_triples)
                         st.divider()
 
                         if st.button("Run Folder Merge", type="primary",
@@ -1482,9 +1595,13 @@ with tab_folder:
                                     all_triples.append((fname, sname, d))
 
                                 with st.spinner("Merging..."):
-                                    groups = (group_sheets_partial(all_triples, overlap_pct)
-                                              if cfg.get("partial_group")
-                                              else group_sheets(all_triples))
+                                    groups = group_sheets(all_triples)
+                                    if cfg.get("merge_all_groups") and len(groups) > 1:
+                                        _ae = [e for _, entries in groups for e in entries]
+                                        _uc = frozenset(c for _, _, df in _ae
+                                                        for c in df.columns
+                                                        if c not in TRACKING_COLS)
+                                        groups = [(_uc, _ae)]
                                     # Simple Append: collapse all groups → one output sheet
                                     if cfg.get("merge_all_groups") and len(groups) > 1:
                                         _ae = [e for _, entries in groups for e in entries]
@@ -1604,5 +1721,5 @@ with tab_dash:
 
 
 st.divider()
-st.caption("File Merger Pro · column mapping · type cleaning · dedup audit · "
+st.caption("DataMerge Studio · column mapping · type cleaning · dedup audit · "
            "interactive dashboard · pd.concat() + drop_duplicates()")
