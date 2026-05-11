@@ -98,6 +98,24 @@ def _col_words(name):
     return set(re.split(r"[\s_\-/()+]+", name.lower()))
 
 
+def _dedup_columns(df):
+    """Return df with any duplicate column names made unique (col → col_2, col_3…)."""
+    if not df.columns.duplicated().any():
+        return df
+    seen: dict = {}
+    new_cols = []
+    for c in df.columns:
+        if c not in seen:
+            seen[c] = 0
+            new_cols.append(c)
+        else:
+            seen[c] += 1
+            new_cols.append(f"{c}_{seen[c] + 1}")
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
 def clean_dtypes(df):
     """
     Auto-clean column types in-place.
@@ -105,18 +123,39 @@ def clean_dtypes(df):
       - Date-sounding columns: try pd.to_datetime (dayfirst=True)
       - City/region columns:   strip whitespace + title-case
       - All other str columns: strip whitespace
+
+    Defensive: skips non-string column names, duplicate column names
+    (where df[col] would return a DataFrame rather than a Series), and
+    any column that raises unexpectedly.
     """
     df = df.copy()
     report = []
+    # Build a set of column names that appear more than once — accessing
+    # df[col] for a duplicate name returns a DataFrame, not a Series,
+    # which causes AttributeError on .dtype.  Skip all copies of such names.
+    duped = set(df.columns[df.columns.duplicated(keep=False)])
+
     for col in df.columns:
-        if col in TRACKING_COLS:
+        # Skip tracking cols, duplicates, and non-string names
+        if col in TRACKING_COLS or col in duped:
             continue
+        if not isinstance(col, str):
+            continue
+
+        try:
+            series = df[col]
+            # Extra guard: if somehow still a DataFrame, skip
+            if isinstance(series, pd.DataFrame):
+                continue
+        except Exception:
+            continue
+
         words = _col_words(col)
 
         # ── Date columns ──────────────────────────────────────────────────
-        if words & DATE_KEYWORDS and df[col].dtype == object:
-            conv  = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-            total = int(df[col].notna().sum())
+        if words & DATE_KEYWORDS and series.dtype == object:
+            conv  = pd.to_datetime(series, errors="coerce", dayfirst=True)
+            total = int(series.notna().sum())
             hit   = int(conv.notna().sum())
             if total > 0 and hit / total >= 0.5:
                 df[col] = conv
@@ -124,9 +163,9 @@ def clean_dtypes(df):
                 continue
 
         # ── String cleanup ────────────────────────────────────────────────
-        if df[col].dtype == object:
-            before  = df[col].fillna("").copy()
-            df[col] = df[col].str.strip()
+        if series.dtype == object:
+            before  = series.fillna("").copy()
+            df[col] = series.str.strip()
             if words & (CITY_KEYWORDS | REGION_KEYWORDS):
                 df[col] = df[col].str.title()
                 report.append(f"'{col}' → stripped + title-cased (city/region)")
@@ -1025,6 +1064,15 @@ with tab_upload:
         type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="uploader")
     if uploaded:
         st.session_state["uf"] = uploaded
+        # Warn if new files differ from the last merge — user might lose output
+        _new_fnames = sorted(u.name for u in uploaded)
+        _old_fnames = st.session_state.get("_last_run", {}).get("file_names", [])
+        if _old_fnames and _new_fnames != _old_fnames:
+            st.warning(
+                "⚠️ You have results from a previous merge session. "
+                "Running a new merge will replace them. "
+                "**Download your previous output first** if you haven't already — "
+                "go to the **Merge & Download** tab.")
         st.success(f"{len(uploaded)} file(s) ready. Go to **Merge & Download**.")
         for i, uf in enumerate(uploaded):
             with st.expander(f"File {i+1}: {uf.name}", expanded=True):
@@ -1134,13 +1182,10 @@ with tab_merge:
                         out_name = " + ".join(sorted({e[1] for e in entries}))[:31]
                         dfs = []
                         for fname, sname, df in entries:
-                            d = df.copy()
+                            d = _dedup_columns(df.copy())
                             if add_src:
-                                # Skip if already present (e.g. re-merging a prior output)
                                 if "Source File" not in d.columns:
-                                    d.insert(0, "Source File",  fname)
-                                if "Source Sheet" not in d.columns:
-                                    d.insert(1, "Source Sheet", sname)
+                                    d.insert(0, "Source File", fname)
                             if clean_types:
                                 d, trpt = clean_dtypes(d)
                                 all_type_reports.extend(trpt)
@@ -1161,37 +1206,7 @@ with tab_merge:
                         output_sheets[out_name] = result
                         all_audits.append(audit)
 
-                # Save for dashboard
-                st.session_state["merged_sheets"] = output_sheets
-
-                st.success("Merge complete!")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Groups merged",     len(output_sheets))
-                m2.metric("Total input rows",  f"{total_in:,}")
-                m3.metric("Total output rows", f"{total_out:,}")
-                m4.metric("Rows removed",      f"{total_in - total_out:,}")
-
-                # Type-cleaning report
-                if all_type_reports:
-                    with st.expander(
-                            f"Data Type Cleaning — "
-                            f"{len(set(all_type_reports))} change(s) applied"):
-                        for line in sorted(set(all_type_reports)):
-                            st.markdown(f"- {line}")
-
-                # Duplicate audit
-                show_audit(all_audits)
-
-                # Preview
-                for sname, df in output_sheets.items():
-                    with st.expander(f"Output: '{sname}'  ({len(df):,} rows)",
-                                     expanded=True):
-                        st.dataframe(df.head(100), use_container_width=True,
-                                     hide_index=True)
-                        if len(df) > 100:
-                            st.caption(f"Preview: first 100 of {len(df):,} rows.")
-
-                # Download
+                # Build download bytes
                 if out_fmt.startswith("Excel"):
                     dl_data = to_excel_bytes(output_sheets)
                     dl_name = "merged_output.xlsx"
@@ -1203,22 +1218,64 @@ with tab_merge:
                     dl_name  = "merged_output.csv"
                     dl_mime  = "text/csv"
 
-                # Store in session state — button is rendered OUTSIDE this block
-                # so it persists across widget interactions (e.g. audit download)
-                st.session_state["_upload_dl"] = {
+                # Store everything — rendered persistently below, outside this block
+                st.session_state["merged_sheets"] = output_sheets
+                st.session_state["_upload_dl"]    = {
                     "data": dl_data, "name": dl_name, "mime": dl_mime}
+                st.session_state["_last_run"]     = {
+                    "file_names":    sorted(f.name for f in files),
+                    "metrics":       (len(output_sheets), total_in, total_out),
+                    "type_reports":  sorted(set(all_type_reports)),
+                    "audits":        all_audits,
+                    "output_sheets": output_sheets,
+                }
 
-                st.info("Go to the **📊 Dashboard** tab to explore and export charts.")
+    # ── Persistent results — shown until user explicitly runs a new merge ─
+    # Lives OUTSIDE the if/else so it survives every widget interaction.
+    _lr = st.session_state.get("_last_run")
+    if _lr:
+        _cur_fnames = sorted(f.name for f in files)
+        if _cur_fnames != _lr["file_names"]:
+            st.warning(
+                "⚠️ The files loaded above have changed since this merge was run. "
+                "Results below are from your **previous session**. "
+                "Download now if you still need this output, then run Merge again "
+                "to process the new files.")
 
-        # ── Persistent download — shown even after other widgets are clicked ──
+        _gn, _ti, _to = _lr["metrics"]
+        st.success("✅ Merge complete!")
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1.metric("Groups merged",     _gn)
+        _m2.metric("Total input rows",  f"{_ti:,}")
+        _m3.metric("Total output rows", f"{_to:,}")
+        _m4.metric("Rows removed",      f"{_ti - _to:,}")
+
+        if _lr["type_reports"]:
+            with st.expander(
+                    f"Data Type Cleaning — "
+                    f"{len(_lr['type_reports'])} change(s) applied"):
+                for _line in _lr["type_reports"]:
+                    st.markdown(f"- {_line}")
+
+        show_audit(_lr["audits"])
+
+        for _sname, _df in _lr["output_sheets"].items():
+            with st.expander(f"Output: '{_sname}'  ({len(_df):,} rows)",
+                             expanded=True):
+                st.dataframe(_df.head(100), use_container_width=True,
+                             hide_index=True)
+                if len(_df) > 100:
+                    st.caption(f"Preview: first 100 of {len(_df):,} rows.")
+
         if "_upload_dl" in st.session_state:
             _dl = st.session_state["_upload_dl"]
             st.download_button(
                 f"⬇️ Download {_dl['name']}",
                 data=_dl["data"], file_name=_dl["name"], mime=_dl["mime"],
                 use_container_width=True, type="primary",
-                key="upload_dl_persistent",
-                help="Your last merge output. Re-click 'Run Merge' to regenerate.")
+                key="upload_dl_persistent")
+
+        st.info("Go to the **📊 Dashboard** tab to explore and export charts.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1415,13 +1472,10 @@ with tab_folder:
                                 all_triples = []
                                 all_type_reports = []
                                 for fname, sname, df in mapped_triples:
-                                    d = df.copy()
+                                    d = _dedup_columns(df.copy())
                                     if add_src:
-                                        # Skip if already present (re-merging a prior output)
                                         if "Source File" not in d.columns:
-                                            d.insert(0, "Source File",  fname)
-                                        if "Source Sheet" not in d.columns:
-                                            d.insert(1, "Source Sheet", sname)
+                                            d.insert(0, "Source File", fname)
                                     if clean_types:
                                         d, trpt = clean_dtypes(d)
                                         all_type_reports.extend(trpt)
