@@ -747,10 +747,14 @@ def render_settings(all_cols, tab_key, mapped_triples=None):
     with col_r:
         key_col, excl_cols = None, []
         if cfg["needs_key"] and all_cols:
-            key_col = st.selectbox(
+            # Use a "— pick a column —" placeholder so we don't auto-run a join
+            # with a wrong default key, which can crash on large data
+            KEY_PLACEHOLDER = "— pick a key column —"
+            key_choice = st.selectbox(
                 "Key column  — must exist in every file (use column mapping above to align names)",
-                sorted(all_cols),
+                [KEY_PLACEHOLDER] + sorted(all_cols),
                 key=f"key_{tab_key}")
+            key_col = None if key_choice == KEY_PLACEHOLDER else key_choice
         if cfg["allows_excl"] and all_cols:
             excl_cols = st.multiselect(
                 "Columns to IGNORE during duplicate check (optional)",
@@ -767,26 +771,51 @@ def render_settings(all_cols, tab_key, mapped_triples=None):
                            key=f"fmt_{tab_key}", horizontal=True)
 
     # ── 5-row output preview ───────────────────────────────────────────────
+    # Only auto-runs once you've picked an operation + (for joins) an explicit
+    # key column. We cap inputs to 10 rows × 3 sheets so even a many-to-many
+    # join can't blow up memory on Streamlit Cloud's small container.
     if mapped_triples:
         with st.expander(
                 f"👀 Preview — what '{chosen}' will produce (first 5 rows)",
                 expanded=True):
-            try:
-                # Build small input samples (first 5 rows of each sheet)
-                sample_dfs = []
-                for _, _, df in mapped_triples:
-                    d = _dedup_columns(df.copy().head(50))   # cap at 50 input rows per sheet
-                    sample_dfs.append(d)
-                if cfg["needs_key"] and not key_col:
-                    st.caption("⚠️ Select a key column above to see preview.")
-                else:
-                    preview, _ = cfg["fn"](sample_dfs,
-                                           key=key_col,
-                                           excl=set(excl_cols) if excl_cols else None)
+            if cfg["needs_key"] and not key_col:
+                st.info("👆 Pick a key column above to see a live preview.")
+            else:
+                try:
+                    PREVIEW_ROWS_PER_SHEET = 10   # small to keep cloud memory safe
+                    PREVIEW_MAX_SHEETS     = 3
+                    sample_dfs = []
+                    for _, _, df in mapped_triples[:PREVIEW_MAX_SHEETS]:
+                        d = _dedup_columns(df.copy().head(PREVIEW_ROWS_PER_SHEET))
+                        sample_dfs.append(d)
+
+                    # Defensive row-count estimate before running the merge —
+                    # protects against many-to-many key explosions
+                    if cfg["family"] == "join" and key_col:
+                        est_rows = 1
+                        for d in sample_dfs:
+                            if key_col in d.columns:
+                                est_rows *= max(1, len(d))
+                        if est_rows > 50_000:
+                            st.warning(
+                                f"⚠️ Preview skipped — even on a 10-row sample, "
+                                f"the join on key `{key_col}` would produce "
+                                f"≥{est_rows:,} rows (many-to-many explosion). "
+                                f"This usually means `{key_col}` isn't a unique "
+                                f"identifier in your files. Try a column with "
+                                f"unique values per row, or run the full merge "
+                                f"to see the real result.")
+                            return cfg, key_col, excl_cols, clean_types, add_src, out_fmt
+
+                    preview, _ = cfg["fn"](
+                        sample_dfs,
+                        key=key_col,
+                        excl=set(excl_cols) if excl_cols else None)
                     st.dataframe(preview.head(5), use_container_width=True,
                                  hide_index=True)
                     st.caption(
-                        f"Preview built from first 50 rows of each sheet → "
+                        f"Preview built from first {PREVIEW_ROWS_PER_SHEET} rows "
+                        f"of up to {PREVIEW_MAX_SHEETS} sheet(s) → "
                         f"{len(preview):,} preview-rows produced.  "
                         f"The actual run uses your full data.")
                     if len(preview) == 0:
@@ -795,8 +824,8 @@ def render_settings(all_cols, tab_key, mapped_triples=None):
                             "key doesn't match between files. Check that the "
                             "key column has matching values, or revisit the "
                             "Column Alignment step above.")
-            except Exception as e:
-                st.caption(f"Preview unavailable: {e}")
+                except Exception as e:
+                    st.warning(f"Preview unavailable: {type(e).__name__}: {e}")
 
     return cfg, key_col, excl_cols, clean_types, add_src, out_fmt
 
