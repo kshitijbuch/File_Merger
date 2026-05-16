@@ -835,7 +835,7 @@ def render_settings(all_cols, tab_key, mapped_triples=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_dashboard():
-    """Interactive dashboard — reads merged data from session state."""
+    """Full EDA dashboard — reads merged data from session state."""
     sheets = st.session_state.get("merged_sheets")
     if not sheets:
         st.info("Run a merge in **Merge & Download** or **Folder Mode** first, "
@@ -861,7 +861,7 @@ def render_dashboard():
     c5.metric("Avg missing",   f"{df.isnull().mean().mean():.1%}")
     st.divider()
 
-    # Auto-detect column types (defensively — skip cols where df[c] returns DataFrame)
+    # ── Auto-detect column types ──────────────────────────────────────────────
     def _safe_col(c):
         try:
             s = df[c]
@@ -869,34 +869,271 @@ def render_dashboard():
         except Exception:
             return None
 
-    date_cols, num_cols, cat_cols = [], [], []
+    date_cols, num_cols, cat_cols, geo_cols = [], [], [], []
     for c in df.columns:
         if c in TRACKING_COLS:
             continue
         s = _safe_col(c)
         if s is None:
             continue
+        words = _col_words(c)
         if pd.api.types.is_datetime64_any_dtype(s):
             date_cols.append(c)
         elif pd.api.types.is_numeric_dtype(s):
             num_cols.append(c)
-        elif s.dtype == object and 1 < s.nunique() <= 40:
-            cat_cols.append(c)
+        elif s.dtype == object:
+            nu = s.nunique()
+            if words & (REGION_KEYWORDS | CITY_KEYWORDS):
+                geo_cols.append(c)
+                if 1 < nu <= 200:
+                    cat_cols.append(c)
+            elif 1 < nu <= 80:          # wider than original 40
+                cat_cols.append(c)
 
-    # If nothing chart-worthy was found, tell the user clearly
-    if not (date_cols or num_cols or cat_cols or ("Source File" in df.columns)):
+    if not (date_cols or num_cols or cat_cols or geo_cols or
+            ("Source File" in df.columns)):
         st.info(
-            "📊 **No charts produced — your data doesn't have enough variability "
-            "to build a meaningful dashboard.**  \n"
-            "DataMerge Studio looks for: dates (for trend lines), numeric columns "
-            "(for distributions), categorical columns with 2–40 unique values "
-            "(for breakdowns), or a 'Source File' column (for record counts).  \n"
-            "Your data has none of these. The summary metrics above are still valid.")
+            "📊 **No charts produced — your data doesn't have enough variability.**  \n"
+            "DataMerge Studio looks for: date columns, numeric columns, categorical "
+            "columns (≤80 unique values), geographic columns, or a 'Source File' column.  \n"
+            "The summary metrics above are still valid.")
         return
 
     figs_for_export = []   # (title, plotly_fig)
 
-    # ── Source breakdown ──────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # 1 ▸ NUMERICAL ANALYSIS
+    # ══════════════════════════════════════════════════════════════════════════
+    if num_cols:
+        st.subheader("📊 Numerical Analysis")
+
+        # ── Descriptive statistics table ──────────────────────────────────────
+        with st.expander("Descriptive Statistics (mean, std, min, quartiles, max)",
+                         expanded=True):
+            st.dataframe(df[num_cols].describe().T.round(2),
+                         use_container_width=True)
+
+        # ── Histogram with controls ───────────────────────────────────────────
+        st.markdown("**Distribution — Histogram**")
+        ha, hb, hc, hd = st.columns([2, 1, 1, 1])
+        with ha:
+            hist_col = st.selectbox("Column", num_cols, key="dash_hist_col")
+        with hb:
+            nbins = st.slider("Bins", 5, 100, 30, key="dash_hist_bins")
+        with hc:
+            show_box = st.checkbox("Show box plot", value=True, key="dash_hist_box")
+        with hd:
+            hist_color = st.selectbox("Color by", ["(none)"] + cat_cols,
+                                      key="dash_hist_color")
+        if HAS_PLOTLY:
+            color_arg  = None if hist_color == "(none)" else hist_color
+            marginal   = "box" if show_box else None
+            fig = px.histogram(df, x=hist_col, nbins=nbins, color=color_arg,
+                               marginal=marginal,
+                               title=f"Distribution of {hist_col}", height=380,
+                               opacity=0.85)
+            fig.update_layout(bargap=0.05)
+            st.plotly_chart(fig, use_container_width=True)
+            figs_for_export.append((f"Histogram — {hist_col}", fig))
+        else:
+            st.bar_chart(df[hist_col].value_counts().sort_index())
+
+        # ── Correlation heatmap (≥ 2 numeric cols) ────────────────────────────
+        if len(num_cols) >= 2:
+            with st.expander("Correlation Heatmap", expanded=False):
+                corr = df[num_cols].corr().round(2)
+                if HAS_PLOTLY:
+                    fig = px.imshow(corr, text_auto=True, aspect="auto",
+                                    color_continuous_scale="RdBu_r",
+                                    zmin=-1, zmax=1,
+                                    title="Pearson Correlation Matrix", height=420)
+                    st.plotly_chart(fig, use_container_width=True)
+                    figs_for_export.append(("Correlation Heatmap", fig))
+                else:
+                    st.dataframe(corr, use_container_width=True)
+
+        st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 2 ▸ TIME TRENDS
+    # ══════════════════════════════════════════════════════════════════════════
+    if date_cols:
+        st.subheader("📈 Time Trends")
+        ta, tb, tc = st.columns([2, 1, 2])
+        with ta:
+            dcol    = st.selectbox("Date column", date_cols, key="dash_dc")
+        with tb:
+            agg_lbl = st.selectbox("Group by", ["Day", "Week", "Month"],
+                                   key="dash_agg")
+        with tc:
+            metric_opts = (["Count of records"]
+                           + [f"Sum of {c}"  for c in num_cols]
+                           + [f"Mean of {c}" for c in num_cols])
+            metric_ch   = st.selectbox("Metric", metric_opts, key="dash_metric")
+
+        freq = {"Day": "D", "Week": "W",
+                "Month": "ME" if pd.__version__ >= "2.2" else "M"}[agg_lbl]
+        try:
+            base = df.dropna(subset=[dcol]).set_index(dcol)
+            if metric_ch == "Count of records":
+                ts   = base.resample(freq).size().rename("Value").reset_index()
+                ylab = "Count"
+            elif metric_ch.startswith("Sum of "):
+                mc   = metric_ch[7:]
+                ts   = base[mc].resample(freq).sum().rename("Value").reset_index()
+                ylab = f"Sum of {mc}"
+            else:
+                mc   = metric_ch[8:]
+                ts   = base[mc].resample(freq).mean().rename("Value").reset_index()
+                ylab = f"Mean of {mc}"
+
+            if HAS_PLOTLY:
+                fig = px.line(ts, x=dcol, y="Value", markers=True, height=350,
+                              title=f"{ylab} over time  ({agg_lbl})",
+                              labels={"Value": ylab})
+                fig.update_traces(line_color="#2563eb", marker_size=5)
+                fig.update_layout(hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
+                figs_for_export.append((f"Trend — {ylab}", fig))
+            else:
+                st.line_chart(ts.set_index(dcol)["Value"])
+        except Exception as e:
+            st.warning(f"Time trend could not be rendered: {e}")
+
+        st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 3 ▸ CATEGORICAL BREAKDOWNS
+    # ══════════════════════════════════════════════════════════════════════════
+    if cat_cols:
+        st.subheader("📋 Categorical Breakdowns")
+        ca, cb, cc, cd = st.columns([3, 1, 1, 1])
+        with ca:
+            sel_cats = st.multiselect(
+                "Columns to chart  (select any / all)",
+                cat_cols,
+                default=cat_cols[:min(6, len(cat_cols))],
+                key="dash_cats")
+        with cb:
+            top_n = st.slider("Top N values", 5, 30, 15, key="dash_topn")
+        with cc:
+            chart_type = st.radio("Chart type", ["Bar", "Pie"],
+                                  key="dash_cat_type", horizontal=True)
+        with cd:
+            sort_by = st.radio("Sort", ["Count ↓", "A–Z"],
+                               key="dash_cat_sort", horizontal=True)
+
+        if sel_cats:
+            grid_cols = 2
+            rows = (len(sel_cats) + grid_cols - 1) // grid_cols
+            grid = [st.columns(grid_cols) for _ in range(rows)]
+            flat = [cell for row in grid for cell in row]
+            for i, col in enumerate(sel_cats):
+                with flat[i]:
+                    vc = (df[col].value_counts().head(top_n)
+                            .rename_axis(col).reset_index(name="Count"))
+                    if sort_by == "A–Z":
+                        vc = vc.sort_values(col)
+                    if HAS_PLOTLY:
+                        if chart_type == "Bar":
+                            fig = px.bar(vc, x="Count", y=col, orientation="h",
+                                         title=col,
+                                         height=max(300, len(vc) * 26 + 80),
+                                         color="Count",
+                                         color_continuous_scale="Teal")
+                            fig.update_layout(
+                                yaxis={"categoryorder": "total ascending"},
+                                showlegend=False,
+                                coloraxis_showscale=False,
+                                title_font_size=13,
+                                margin=dict(l=10, r=10, t=40, b=10))
+                        else:
+                            fig = px.pie(vc, names=col, values="Count",
+                                         title=col, height=350,
+                                         hole=0.35)
+                            fig.update_traces(textposition="inside",
+                                              textinfo="percent+label")
+                            fig.update_layout(title_font_size=13,
+                                              showlegend=True)
+                        st.plotly_chart(fig, use_container_width=True)
+                        figs_for_export.append((f"Category — {col}", fig))
+                    else:
+                        st.write(f"**{col}**")
+                        st.bar_chart(vc.set_index(col))
+        else:
+            st.info("Select at least one column above to see charts.")
+
+        st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 4 ▸ GEOGRAPHIC / REGION DISTRIBUTION
+    # ══════════════════════════════════════════════════════════════════════════
+    geo_candidates = geo_cols if geo_cols else [
+        c for c in cat_cols
+        if any(kw in c.lower() for kw in
+               {"city","town","state","region","zone","area","territory",
+                "country","district","branch","location","place"})]
+
+    if geo_candidates:
+        st.subheader("🗺️ Geographic / Region Distribution")
+        ga, gb, gc = st.columns([2, 1, 1])
+        with ga:
+            map_col = st.selectbox("Region / location column",
+                                   geo_candidates, key="dash_mapcol")
+        with gb:
+            map_topn = st.slider("Top N regions", 5, 60, 25, key="dash_mapn")
+        with gc:
+            map_style = st.radio("Chart style", ["Horizontal Bar", "Choropleth Map"],
+                                 key="dash_mapstyle", horizontal=False)
+
+        rc = (df[map_col].value_counts().head(map_topn)
+                .rename_axis("Region").reset_index(name="Count"))
+
+        if HAS_PLOTLY:
+            rendered_map = False
+            if map_style == "Choropleth Map":
+                try:
+                    fig = px.choropleth(
+                        rc, locations="Region",
+                        locationmode="country names",
+                        color="Count", hover_name="Region",
+                        color_continuous_scale="Blues",
+                        title=f"Geographic Distribution — {map_col}",
+                        height=460)
+                    fig.update_layout(geo=dict(showframe=False,
+                                               showcoastlines=True))
+                    st.plotly_chart(fig, use_container_width=True)
+                    figs_for_export.append((f"Map — {map_col}", fig))
+                    rendered_map = True
+                except Exception:
+                    st.caption("⚠️ Choropleth requires standard country names or "
+                               "ISO codes. Falling back to bar chart.")
+
+            if not rendered_map:
+                fig = px.bar(
+                    rc.sort_values("Count"),
+                    x="Count", y="Region", orientation="h",
+                    title=f"Region Distribution — {map_col}",
+                    height=max(350, len(rc) * 24 + 80),
+                    color="Count", color_continuous_scale="Blues")
+                fig.update_layout(
+                    yaxis={"categoryorder": "total ascending"},
+                    coloraxis_showscale=False,
+                    margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                figs_for_export.append((f"Region — {map_col}", fig))
+                if map_style == "Choropleth Map":
+                    st.caption(
+                        "💡 For a true world map, ensure your column contains "
+                        "standard country names (e.g. 'India', 'United States').")
+        else:
+            st.bar_chart(rc.set_index("Region"))
+
+        st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 5 ▸ RECORDS BY SOURCE FILE  (keep as-is)
+    # ══════════════════════════════════════════════════════════════════════════
     if "Source File" in df.columns:
         st.subheader("Records by Source File")
         src = (df["Source File"].value_counts()
@@ -909,61 +1146,11 @@ def render_dashboard():
             figs_for_export.append(("Records by Source File", fig))
         else:
             st.bar_chart(src.set_index("Source File"))
+        st.divider()
 
-    # ── Date trends ───────────────────────────────────────────────────────────
-    if date_cols:
-        st.subheader("Date Trends")
-        dc1, dc2 = st.columns([2, 1])
-        with dc1:
-            dcol = st.selectbox("Date column", date_cols, key="dash_dc")
-        with dc2:
-            agg_lbl = st.selectbox("Group by", ["Day", "Week", "Month"], key="dash_agg")
-        freq = {"Day": "D", "Week": "W", "Month": "ME" if pd.__version__ >= "2.2" else "M"}[agg_lbl]
-        ts = (df.set_index(dcol).resample(freq).size()
-                .rename("Count").reset_index())
-        if HAS_PLOTLY:
-            fig = px.line(ts, x=dcol, y="Count", markers=True, height=300)
-            fig.update_traces(line_color="#2563eb")
-            st.plotly_chart(fig, use_container_width=True)
-            figs_for_export.append((f"Trend by {dcol}", fig))
-        else:
-            st.line_chart(ts.set_index(dcol))
-
-    # ── Categorical breakdowns ────────────────────────────────────────────────
-    if cat_cols:
-        st.subheader("Categorical Breakdowns")
-        sel_cats = st.multiselect(
-            "Columns to chart", cat_cols,
-            default=cat_cols[:min(4, len(cat_cols))], key="dash_cats")
-        if sel_cats:
-            ncols = min(len(sel_cats), 2)
-            rows  = (len(sel_cats) + ncols - 1) // ncols
-            grid  = [st.columns(ncols) for _ in range(rows)]
-            flat  = [cell for row in grid for cell in row]
-            for i, col in enumerate(sel_cats):
-                with flat[i]:
-                    vc = (df[col].value_counts().head(15)
-                            .rename_axis(col).reset_index(name="Count"))
-                    if HAS_PLOTLY:
-                        fig = px.bar(vc, x="Count", y=col, orientation="h",
-                                     title=col, height=350, color="Count",
-                                     color_continuous_scale="Teal")
-                        fig.update_layout(
-                            yaxis={"categoryorder": "total ascending"},
-                            showlegend=False, coloraxis_showscale=False,
-                            title_font_size=13)
-                        st.plotly_chart(fig, use_container_width=True)
-                        figs_for_export.append((col, fig))
-                    else:
-                        st.write(f"**{col}**")
-                        st.bar_chart(vc.set_index(col))
-
-    # ── Numeric summary ───────────────────────────────────────────────────────
-    if num_cols:
-        st.subheader("Numeric Column Summary")
-        st.dataframe(df[num_cols].describe().T.round(2), use_container_width=True)
-
-    # ── Data quality ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # 6 ▸ MISSING VALUES %  (keep as-is)
+    # ══════════════════════════════════════════════════════════════════════════
     st.subheader("Missing Values % by Column")
     null_s = (df.isnull().sum() / len(df) * 100).round(1).sort_values(ascending=False)
     null_s = null_s[null_s > 0]
@@ -979,8 +1166,11 @@ def render_dashboard():
         figs_for_export.append(("Missing Values %", fig))
     else:
         st.bar_chart(null_s)
+    st.divider()
 
-    # ── Data explorer ─────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # 7 ▸ DATA EXPLORER  (keep as-is)
+    # ══════════════════════════════════════════════════════════════════════════
     st.subheader("Data Explorer")
     with st.expander("Filter & browse merged data", expanded=False):
         fc1, fc2 = st.columns(2)
@@ -1005,7 +1195,9 @@ def render_dashboard():
         st.caption(f"Showing {len(view_df):,} of {len(df):,} rows")
         st.dataframe(view_df, use_container_width=True, height=400, hide_index=True)
 
-    # ── Export standalone HTML ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # 8 ▸ EXPORT STANDALONE HTML
+    # ══════════════════════════════════════════════════════════════════════════
     st.subheader("Export Dashboard")
     if not HAS_PLOTLY:
         st.info("Install plotly to enable HTML export:  `pip install plotly`")
@@ -1014,11 +1206,12 @@ def render_dashboard():
                      type="secondary", use_container_width=True):
             parts = [
                 "<html><head><meta charset='utf-8'>",
-                f"<title>Dashboard — {sel}</title>",
+                f"<title>EDA Dashboard — {sel}</title>",
                 "<style>body{font-family:sans-serif;margin:32px;background:#f9fafb;}"
-                "h1{color:#1e3a5f;}h2{color:#374151;margin-top:32px;}"
+                "h1{color:#1e3a5f;}h2{color:#374151;margin-top:32px;border-top:"
+                "1px solid #e2e8f0;padding-top:16px;}"
                 "p{color:#6b7280;}</style></head><body>",
-                f"<h1>DataMerge Studio — Dashboard</h1>",
+                "<h1>DataMerge Studio — EDA Dashboard</h1>",
                 f"<p><b>Sheet:</b> {sel} &nbsp;|&nbsp; "
                 f"<b>Rows:</b> {len(df):,} &nbsp;|&nbsp; "
                 f"<b>Columns:</b> {len(df.columns)}</p>",
@@ -1028,11 +1221,11 @@ def render_dashboard():
                 parts.append(f"<h2>{title}</h2>")
                 parts.append(fig.to_html(
                     full_html=False,
-                    include_plotlyjs=True if first else False))
+                    include_plotlyjs="cdn" if first else False))
                 first = False
             parts.append("</body></html>")
             st.download_button(
-                "Download dashboard.html",
+                "⬇️ Download dashboard.html",
                 data="\n".join(parts).encode("utf-8"),
                 file_name="dashboard.html",
                 mime="text/html",
