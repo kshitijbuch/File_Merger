@@ -1371,6 +1371,11 @@ with tab_upload:
                                           "key_", "excl_", "clean_", "src_",
                                           "fmt_", "fc_")):
                             st.session_state.pop(_k, None)
+                    # Rotate the uploader key — forces Streamlit to render a
+                    # completely fresh file_uploader widget (the only reliable
+                    # way to clear file chips from the browser UI)
+                    st.session_state["_uploader_key"] = (
+                        st.session_state.get("_uploader_key", 0) + 1)
                     st.rerun()
                 if _no.button("Cancel", key="confirm_no",
                               use_container_width=True):
@@ -1382,9 +1387,11 @@ with tab_upload:
                              help="Clear all uploaded files, mappings, and results."):
                     st.session_state["_confirm_new_session"] = True
                     st.rerun()
+    _uploader_key = f"uploader_{st.session_state.get('_uploader_key', 0)}"
     uploaded = st.file_uploader(
         "Drag & drop files here, or click Browse",
-        type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="uploader")
+        type=["csv", "xlsx", "xls"], accept_multiple_files=True,
+        key=_uploader_key)
     if uploaded:
         st.session_state["uf"] = uploaded
         # Warn if new files differ from the last merge — user might lose output
