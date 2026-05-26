@@ -30,6 +30,7 @@ st.set_page_config(page_title="DataMerge Studio", page_icon="🔀",
 
 st.markdown("""
 <style>
+/* ── Badges ─────────────────────────────────────────────── */
 .badge {display:inline-block;padding:3px 10px;border-radius:12px;
         font-size:.78em;font-weight:600;margin-bottom:8px;}
 .badge-blue   {background:#dbeafe;color:#1d4ed8;}
@@ -38,8 +39,27 @@ st.markdown("""
 .badge-red    {background:#fee2e2;color:#991b1b;}
 .badge-purple {background:#ede9fe;color:#5b21b6;}
 .badge-teal   {background:#ccfbf1;color:#0f766e;}
-.group-box {background:#f8fafc;border:1px solid #e2e8f0;
-            border-radius:8px;padding:12px;margin-bottom:10px;}
+
+/* ── Group boxes (light mode) ───────────────────────────── */
+.group-box        {border:1px solid #e2e8f0;border-radius:8px;
+                   padding:12px;margin-bottom:10px;
+                   background:#f8fafc;color:#1e293b;}
+.group-box-multi  {background:#f0fdf4;}
+.group-box-single {background:#fefce8;}
+
+/* ── Dark-mode overrides ────────────────────────────────── */
+[data-theme="dark"] .badge-blue   {background:#1e3a5f;color:#93c5fd;}
+[data-theme="dark"] .badge-green  {background:#14532d;color:#86efac;}
+[data-theme="dark"] .badge-orange {background:#431407;color:#fcd34d;}
+[data-theme="dark"] .badge-red    {background:#450a0a;color:#fca5a5;}
+[data-theme="dark"] .badge-purple {background:#2e1065;color:#c4b5fd;}
+[data-theme="dark"] .badge-teal   {background:#042f2e;color:#5eead4;}
+[data-theme="dark"] .group-box,
+[data-theme="dark"] .group-box-multi,
+[data-theme="dark"] .group-box-single {
+    background:#1e293b !important;
+    border-color:#334155 !important;
+    color:#f1f5f9 !important;}
 </style>""", unsafe_allow_html=True)
 
 
@@ -1511,11 +1531,11 @@ with tab_merge:
             file_names  = sorted({e[0] for e in entries})
             sheet_names = sorted({e[1] for e in entries})
             total_rows  = sum(len(e[2]) for e in entries)
-            bg     = "#f0fdf4" if len(entries) > 1 else "#fefce8"
+            _gcls  = "group-box group-box-multi" if len(entries) > 1 else "group-box group-box-single"
             action = (f"MERGE {len(entries)} sheets"
                       if len(entries) > 1 else "1 sheet (no merge needed)")
             st.markdown(
-                f'<div class="group-box" style="background:{bg}">'
+                f'<div class="{_gcls}">'
                 f'<b>Group {i+1}</b> — {len(cols_key)} columns — '
                 f'{total_rows:,} rows — {action}<br>'
                 f'<small>Sheet names: {", ".join(sheet_names)}<br>'
