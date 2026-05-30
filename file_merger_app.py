@@ -1270,6 +1270,185 @@ def render_dashboard():
             st.caption("Fully self-contained HTML — no internet or Streamlit needed to view it.")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DEDUP TAB
+# ══════════════════════════════════════════════════════════════════════════════
+def render_dedup_tab():
+    """Stand-alone duplicate-removal tool for a single uploaded file."""
+    st.markdown(
+        "Upload **one** CSV or Excel file, choose which columns to **exclude** "
+        "from the comparison, then download a clean file with duplicates removed.")
+
+    # ── File uploader (own key so New Session can clear it) ──────────────────
+    _dkey = f"dedup_file_{st.session_state.get('_dedup_key', 0)}"
+    uploaded = st.file_uploader(
+        "Upload file to deduplicate",
+        type=["csv", "xlsx", "xls"],
+        key=_dkey,
+        help="Single file only — CSV or any Excel format.")
+
+    if not uploaded:
+        st.info("⬆️ Upload a file above to get started.")
+        return
+
+    # ── Load ─────────────────────────────────────────────────────────────────
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            df_raw     = pd.read_csv(uploaded)
+            sheet_used = None
+        else:
+            xf     = pd.ExcelFile(uploaded)
+            sheets = xf.sheet_names
+            if len(sheets) > 1:
+                sheet_used = st.selectbox(
+                    "Sheet to deduplicate", sheets, key="dedup_sheet")
+            else:
+                sheet_used = sheets[0]
+            df_raw = pd.read_excel(xf, sheet_name=sheet_used)
+    except Exception as exc:
+        st.error(f"Could not read file: {exc}")
+        return
+
+    _sheet_note = f" (sheet: *{sheet_used}*)" if sheet_used else ""
+    st.success(
+        f"Loaded **{len(df_raw):,} rows × {len(df_raw.columns)} columns**"
+        f"{_sheet_note}")
+
+    all_cols = df_raw.columns.tolist()
+
+    # ── Settings ─────────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### ⚙️ Deduplication settings")
+
+    cfg_l, cfg_r = st.columns([3, 1])
+    with cfg_l:
+        exclude_cols = st.multiselect(
+            "Columns to **exclude** from the duplicate check",
+            all_cols,
+            key="dedup_excl",
+            help=(
+                "Duplicates are detected by comparing every column "
+                "**except** the ones you select here. "
+                "Useful for ignoring auto-generated IDs, timestamps, or "
+                "notes that differ even when the core data is the same."))
+    with cfg_r:
+        keep = st.radio(
+            "When duplicates found, keep:",
+            ["First", "Last"],
+            key="dedup_keep",
+            help="'First' keeps the earliest row; 'Last' keeps the latest.")
+
+    opt_l, opt_r = st.columns(2)
+    with opt_l:
+        case_insensitive = st.checkbox(
+            "Case-insensitive comparison",
+            value=False,
+            key="dedup_ci",
+            help="Treat 'ABC' and 'abc' as the same value in text columns.")
+    with opt_r:
+        trim_ws = st.checkbox(
+            "Trim whitespace before comparing",
+            value=True,
+            key="dedup_trim",
+            help="Strip leading/trailing spaces from text values before comparing.")
+
+    # ── Compute ──────────────────────────────────────────────────────────────
+    check_cols = [c for c in all_cols if c not in exclude_cols]
+
+    if not check_cols:
+        st.warning(
+            "All columns are excluded — there is nothing left to compare. "
+            "Please exclude fewer columns.")
+        return
+
+    # Build a comparison frame with optional normalisation
+    df_cmp = df_raw[check_cols].copy()
+    for col in df_cmp.select_dtypes(include="object").columns:
+        if trim_ws:
+            df_cmp[col] = df_cmp[col].astype(str).str.strip()
+        if case_insensitive:
+            df_cmp[col] = df_cmp[col].str.lower()
+
+    dup_mask = df_cmp.duplicated(keep=keep.lower())
+    n_dups   = int(dup_mask.sum())
+    n_kept   = len(df_raw) - n_dups
+
+    # ── Result metrics ───────────────────────────────────────────────────────
+    st.divider()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total rows in file", f"{len(df_raw):,}")
+    m2.metric(
+        "Duplicate rows found",
+        f"{n_dups:,}",
+        delta=f"-{n_dups:,}" if n_dups else None,
+        delta_color="inverse")
+    m3.metric("Rows after deduplication", f"{n_kept:,}")
+
+    if n_dups == 0:
+        st.success(
+            "✅ No duplicates found — your data is already clean! "
+            "You can still download the file unchanged below.")
+    else:
+        cols_used_str  = ", ".join(f"`{c}`" for c in check_cols)
+        cols_excl_str  = (
+            "  \nIgnored columns: " + ", ".join(f"`{c}`" for c in exclude_cols)
+            if exclude_cols else "")
+        st.warning(
+            f"**{n_dups:,} duplicate row(s) will be removed.**  \n"
+            f"Compared on {len(check_cols)} column(s): {cols_used_str}"
+            f"{cols_excl_str}")
+
+        with st.expander(
+                f"👁️ Preview rows that will be removed ({n_dups:,})",
+                expanded=False):
+            st.dataframe(df_raw[dup_mask].reset_index(drop=True),
+                         use_container_width=True, height=300)
+
+    df_result = df_raw[~dup_mask].reset_index(drop=True)
+
+    # ── Download ─────────────────────────────────────────────────────────────
+    st.divider()
+    dl_fmt   = st.radio(
+        "Download format",
+        ["Excel (.xlsx)", "CSV (.csv)"],
+        horizontal=True,
+        key="dedup_fmt")
+    base     = uploaded.name.rsplit(".", 1)[0]
+    btn_label = (
+        f"⬇️ Download deduplicated file  ({n_kept:,} rows"
+        f"{', ' + str(n_dups) + ' removed' if n_dups else ', no change'})")
+
+    if dl_fmt.startswith("Excel"):
+        _buf = io.BytesIO()
+        with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
+            df_result.to_excel(
+                _w, index=False,
+                sheet_name=sheet_used if sheet_used else "Deduplicated")
+        st.download_button(
+            btn_label,
+            data=_buf.getvalue(),
+            file_name=f"{base}_deduped.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+            key="dedup_dl_xlsx")
+    else:
+        _csv = df_result.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            btn_label,
+            data=_csv,
+            file_name=f"{base}_deduped.csv",
+            mime="text/csv",
+            type="primary",
+            use_container_width=True,
+            key="dedup_dl_csv")
+
+    if exclude_cols:
+        st.caption(
+            f"Columns used in comparison ({len(check_cols)}): "
+            + ", ".join(check_cols))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1283,7 +1462,7 @@ st.divider()
 
 # Folder Mode tab is only shown when running locally (requires filesystem access)
 _tab_names = ["📚 Learn Merge & Joins", "📁 Upload Files",
-              "🔀 Merge & Download", "📊 Dashboard"]
+              "🔀 Merge & Download", "📊 Dashboard", "🧹 Deduplicate"]
 if HAS_TKINTER:
     _tab_names.insert(3, "📂 Folder Mode")
 
@@ -1294,9 +1473,11 @@ tab_merge  = _tabs[2]
 if HAS_TKINTER:
     tab_folder = _tabs[3]
     tab_dash   = _tabs[4]
+    tab_dedup  = _tabs[5]
 else:
     tab_folder = None   # never rendered on cloud
     tab_dash   = _tabs[3]
+    tab_dedup  = _tabs[4]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1420,11 +1601,13 @@ with tab_upload:
                                           "key_", "excl_", "clean_", "src_",
                                           "fmt_", "fc_", "drop_")):
                             st.session_state.pop(_k, None)
-                    # Rotate the uploader key — forces Streamlit to render a
-                    # completely fresh file_uploader widget (the only reliable
-                    # way to clear file chips from the browser UI)
+                    # Rotate uploader keys — forces Streamlit to render fresh
+                    # file_uploader widgets (the only reliable way to clear
+                    # file chips from the browser UI)
                     st.session_state["_uploader_key"] = (
                         st.session_state.get("_uploader_key", 0) + 1)
+                    st.session_state["_dedup_key"] = (
+                        st.session_state.get("_dedup_key", 0) + 1)
                     st.rerun()
                 if _no.button("Cancel", key="confirm_no",
                               use_container_width=True):
@@ -2038,12 +2221,20 @@ if HAS_TKINTER:
                                          "Re-click 'Run Folder Merge' to regenerate.")
 
 
-        # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_dash:
     st.subheader("Dashboard")
     render_dashboard()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — DEDUPLICATE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_dedup:
+    st.subheader("🧹 Remove Duplicates from a Single File")
+    render_dedup_tab()
 
 
 st.divider()
